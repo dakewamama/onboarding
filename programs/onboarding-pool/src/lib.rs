@@ -16,4 +16,8 @@ pub mod onboarding_pool {
     pub fn initialize_pool(ctx: Context<InitializePool>, seed: u64) -> Result<()> {
         ctx.accounts.initialize_pool(seed, ctx.bumps)
     }
+
+    pub fn deposit(ctx: Context<Deposit>, amount: u64) -> Result<()> {
+        ctx.accounts.deposit(amount, ctx.bumps)
+    }
 }
