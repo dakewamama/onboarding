@@ -83,6 +83,27 @@ describe("onboarding-pool", () => {
       .rpc();
   }
 
+  async function withdraw(
+    userKp: Keypair,
+    userAta: PublicKey,
+    amount: anchor.BN
+  ) {
+    await program.methods
+      .withdraw(amount)
+      .accountsPartial({
+        user: userKp.publicKey,
+        payer: authority.publicKey,
+        mint,
+        pool,
+        position: derivePosition(userKp.publicKey),
+        userAta,
+        vault,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .signers([userKp])
+      .rpc();
+  }
+
   async function assertSolvent() {
     const vaultAccount = await getAccount(provider.connection, vault);
     const poolAccount = await program.account.pool.fetch(pool);
@@ -309,6 +330,51 @@ describe("onboarding-pool", () => {
       diff.lte(principal),
       `accrued ${end.accruedUnits} expected ~${expected}`
     );
+
+    await assertSolvent();
+  });
+
+  it("reduces principal and zeroes accrued units on a partial withdraw", async () => {
+    const user = await createFundedUser(5_000_000n);
+    await deposit(user.kp, user.ata, new anchor.BN(3_000_000));
+
+    await sleep(1500);
+    await withdraw(user.kp, user.ata, new anchor.BN(1_000_000));
+
+    const position = await program.account.position.fetch(
+      derivePosition(user.kp.publicKey)
+    );
+    assert.strictEqual(position.principal.toString(), "2000000");
+    assert.strictEqual(position.accruedUnits.toString(), "0");
+
+    await assertSolvent();
+  });
+
+  it("withdraws the full amount and leaves the position open", async () => {
+    const user = await createFundedUser(5_000_000n);
+    await deposit(user.kp, user.ata, new anchor.BN(2_000_000));
+
+    await withdraw(user.kp, user.ata, new anchor.BN(2_000_000));
+
+    const position = await program.account.position.fetch(
+      derivePosition(user.kp.publicKey)
+    );
+    assert.strictEqual(position.principal.toString(), "0");
+    assert.isTrue(position.owner.equals(user.kp.publicKey));
+
+    await assertSolvent();
+  });
+
+  it("rejects a withdraw exceeding principal", async () => {
+    const user = await createFundedUser(5_000_000n);
+    await deposit(user.kp, user.ata, new anchor.BN(1_000_000));
+
+    try {
+      await withdraw(user.kp, user.ata, new anchor.BN(1_500_000));
+      assert.fail("expected InsufficientPrincipal");
+    } catch (err) {
+      assert.include(err.toString(), "InsufficientPrincipal");
+    }
 
     await assertSolvent();
   });
