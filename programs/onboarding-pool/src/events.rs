@@ -23,3 +23,11 @@ pub struct Withdrawn {
     pub amount: u64,
     pub total_principal: u64,
 }
+
+#[event]
+pub struct YieldSwept {
+    pub pool: Pubkey,
+    pub treasury: Pubkey,
+    pub amount: u64,
+    pub total_principal: u64,
+}

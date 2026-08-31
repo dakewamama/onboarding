@@ -24,4 +24,8 @@ pub mod onboarding_pool {
     pub fn withdraw(ctx: Context<Withdraw>, amount: u64) -> Result<()> {
         ctx.accounts.withdraw(amount)
     }
+
+    pub fn sweep_yield(ctx: Context<SweepYield>) -> Result<()> {
+        ctx.accounts.sweep_yield()
+    }
 }
