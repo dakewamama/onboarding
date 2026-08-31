@@ -83,6 +83,21 @@ describe("onboarding-pool", () => {
       .rpc();
   }
 
+  async function sweep(treasuryAccount: PublicKey, signer?: Keypair) {
+    const builder = program.methods.sweepYield().accountsPartial({
+      authority: signer ? signer.publicKey : authority.publicKey,
+      mint,
+      pool,
+      vault,
+      treasury: treasuryAccount,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    });
+    if (signer) {
+      return builder.signers([signer]).rpc();
+    }
+    return builder.rpc();
+  }
+
   async function withdraw(
     userKp: Keypair,
     userAta: PublicKey,
@@ -374,6 +389,79 @@ describe("onboarding-pool", () => {
       assert.fail("expected InsufficientPrincipal");
     } catch (err) {
       assert.include(err.toString(), "InsufficientPrincipal");
+    }
+
+    await assertSolvent();
+  });
+
+  it("rejects a sweep when there is no excess", async () => {
+    try {
+      await sweep(treasury);
+      assert.fail("expected NothingToSweep");
+    } catch (err) {
+      assert.include(err.toString(), "NothingToSweep");
+    }
+
+    await assertSolvent();
+  });
+
+  it("sweeps excess above the margin and leaves principal untouched", async () => {
+    const injected = 10_000n;
+    await mintTo(
+      provider.connection,
+      (authority as anchor.Wallet).payer,
+      mint,
+      vault,
+      authority.publicKey,
+      injected
+    );
+
+    const poolBefore = await program.account.pool.fetch(pool);
+    const treasuryBefore = await getAccount(provider.connection, treasury);
+
+    await sweep(treasury);
+
+    const poolAfter = await program.account.pool.fetch(pool);
+    const treasuryAfter = await getAccount(provider.connection, treasury);
+
+    const expectedSwept = injected - 1_000n;
+    assert.strictEqual(
+      (treasuryAfter.amount - treasuryBefore.amount).toString(),
+      expectedSwept.toString()
+    );
+    assert.strictEqual(
+      poolAfter.totalPrincipal.toString(),
+      poolBefore.totalPrincipal.toString()
+    );
+
+    await assertSolvent();
+  });
+
+  it("rejects a sweep from a non authority", async () => {
+    const intruder = Keypair.generate();
+    try {
+      await sweep(treasury, intruder);
+      assert.fail("expected a has_one violation");
+    } catch (err) {
+      assert.include(err.toString(), "ConstraintHasOne");
+    }
+
+    await assertSolvent();
+  });
+
+  it("rejects a sweep to a treasury other than the pool treasury", async () => {
+    const wrong = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      (authority as anchor.Wallet).payer,
+      mint,
+      Keypair.generate().publicKey
+    );
+
+    try {
+      await sweep(wrong.address);
+      assert.fail("expected InvalidTreasury");
+    } catch (err) {
+      assert.include(err.toString(), "InvalidTreasury");
     }
 
     await assertSolvent();
