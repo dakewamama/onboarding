@@ -28,4 +28,12 @@ pub mod onboarding_pool {
     pub fn sweep_yield(ctx: Context<SweepYield>) -> Result<()> {
         ctx.accounts.sweep_yield()
     }
+
+    pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
+        ctx.accounts.set_paused(paused)
+    }
+
+    pub fn set_treasury(ctx: Context<SetTreasury>, treasury: Pubkey) -> Result<()> {
+        ctx.accounts.set_treasury(treasury)
+    }
 }
