@@ -83,6 +83,13 @@ describe("onboarding-pool", () => {
       .rpc();
   }
 
+  async function setPaused(paused: boolean) {
+    await program.methods
+      .setPaused(paused)
+      .accountsPartial({ authority: authority.publicKey, pool })
+      .rpc();
+  }
+
   async function sweep(treasuryAccount: PublicKey, signer?: Keypair) {
     const builder = program.methods.sweepYield().accountsPartial({
       authority: signer ? signer.publicKey : authority.publicKey,
@@ -463,6 +470,32 @@ describe("onboarding-pool", () => {
     } catch (err) {
       assert.include(err.toString(), "InvalidTreasury");
     }
+
+    await assertSolvent();
+  });
+
+  it("blocks deposit and withdraw while paused", async () => {
+    const user = await createFundedUser(5_000_000n);
+    await deposit(user.kp, user.ata, new anchor.BN(2_000_000));
+
+    await setPaused(true);
+
+    try {
+      await deposit(user.kp, user.ata, new anchor.BN(1_000_000));
+      assert.fail("expected Paused on deposit");
+    } catch (err) {
+      assert.include(err.toString(), "Paused");
+    }
+
+    try {
+      await withdraw(user.kp, user.ata, new anchor.BN(1_000_000));
+      assert.fail("expected Paused on withdraw");
+    } catch (err) {
+      assert.include(err.toString(), "Paused");
+    }
+
+    await setPaused(false);
+    await withdraw(user.kp, user.ata, new anchor.BN(2_000_000));
 
     await assertSolvent();
   });
