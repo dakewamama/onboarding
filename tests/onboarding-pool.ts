@@ -90,6 +90,13 @@ describe("onboarding-pool", () => {
       .rpc();
   }
 
+  async function setTreasury(newTreasury: PublicKey) {
+    await program.methods
+      .setTreasury(newTreasury)
+      .accountsPartial({ authority: authority.publicKey, mint, pool, newTreasury })
+      .rpc();
+  }
+
   async function sweep(treasuryAccount: PublicKey, signer?: Keypair) {
     const builder = program.methods.sweepYield().accountsPartial({
       authority: signer ? signer.publicKey : authority.publicKey,
@@ -498,5 +505,45 @@ describe("onboarding-pool", () => {
     await withdraw(user.kp, user.ata, new anchor.BN(2_000_000));
 
     await assertSolvent();
+  });
+
+  it("updates the treasury to another account of the same mint", async () => {
+    const fresh = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      (authority as anchor.Wallet).payer,
+      mint,
+      Keypair.generate().publicKey
+    );
+
+    await setTreasury(fresh.address);
+    let poolAccount = await program.account.pool.fetch(pool);
+    assert.isTrue(poolAccount.treasury.equals(fresh.address));
+
+    await setTreasury(treasury);
+    poolAccount = await program.account.pool.fetch(pool);
+    assert.isTrue(poolAccount.treasury.equals(treasury));
+  });
+
+  it("rejects a treasury update whose mint differs from the pool mint", async () => {
+    const otherMint = await createMint(
+      provider.connection,
+      (authority as anchor.Wallet).payer,
+      authority.publicKey,
+      null,
+      6
+    );
+    const otherAta = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      (authority as anchor.Wallet).payer,
+      otherMint,
+      authority.publicKey
+    );
+
+    try {
+      await setTreasury(otherAta.address);
+      assert.fail("expected a token mint constraint violation");
+    } catch (err) {
+      assert.include(err.toString(), "ConstraintTokenMint");
+    }
   });
 });
