@@ -481,7 +481,7 @@ describe("onboarding-pool", () => {
     await assertSolvent();
   });
 
-  it("blocks deposit and withdraw while paused", async () => {
+  it("blocks deposit and sweep while paused but never withdraw", async () => {
     const user = await createFundedUser(5_000_000n);
     await deposit(user.kp, user.ata, new anchor.BN(2_000_000));
 
@@ -495,15 +495,20 @@ describe("onboarding-pool", () => {
     }
 
     try {
-      await withdraw(user.kp, user.ata, new anchor.BN(1_000_000));
-      assert.fail("expected Paused on withdraw");
+      await sweep(treasury);
+      assert.fail("expected Paused on sweep");
     } catch (err) {
       assert.include(err.toString(), "Paused");
     }
 
-    await setPaused(false);
+    // Invariant 3: withdrawal liveness holds even while paused.
     await withdraw(user.kp, user.ata, new anchor.BN(2_000_000));
+    const position = await program.account.position.fetch(
+      derivePosition(user.kp.publicKey)
+    );
+    assert.strictEqual(position.principal.toString(), "0");
 
+    await setPaused(false);
     await assertSolvent();
   });
 

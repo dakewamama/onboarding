@@ -41,7 +41,8 @@ pub struct Withdraw<'info> {
 
 impl<'info> Withdraw<'info> {
     pub fn withdraw(&mut self, amount: u64) -> Result<()> {
-        require!(!self.pool.paused, PoolError::Paused);
+        // Invariant 3 (withdrawal liveness): withdraw never checks `paused`.
+        // A user with sufficient principal can always exit, regardless of pool state.
         require!(amount > 0, PoolError::InvalidAmount);
 
         let now = Clock::get()?.unix_timestamp;
@@ -78,11 +79,8 @@ impl<'info> Withdraw<'info> {
     }
 
     pub fn withdraw_tokens(&self, amount: u64) -> Result<()> {
-        let signer_seeds: &[&[&[u8]]] = &[&[
-            b"pool",
-            &self.pool.seed.to_le_bytes(),
-            &[self.pool.bump],
-        ]];
+        let signer_seeds: &[&[&[u8]]] =
+            &[&[b"pool", &self.pool.seed.to_le_bytes(), &[self.pool.bump]]];
 
         let cpi_program = self.token_program.to_account_info();
 
