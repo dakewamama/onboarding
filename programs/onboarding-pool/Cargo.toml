@@ -19,3 +19,13 @@ idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
 [dependencies]
 anchor-lang = { version = "0.32.1", features = ["init-if-needed"] }
 anchor-spl = { version = "0.32.1", features = ["token"] }
+
+# Anchor's derive/program macros emit cfgs (anchor-debug, custom-heap,
+# custom-panic, target_os = "solana") that are not declared features of this
+# crate, which the unexpected_cfgs lint flags as errors under
+# `clippy -D warnings`. Whitelist them so a genuine typo elsewhere still warns.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = [
+    'cfg(feature, values("anchor-debug", "custom-heap", "custom-panic"))',
+    'cfg(target_os, values("solana"))',
+] }
