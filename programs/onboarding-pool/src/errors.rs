@@ -12,8 +12,8 @@ pub enum PoolError {
     InvalidTreasury,
     #[msg("Token account mint does not match the pool mint")]
     InvalidMint,
-    #[msg("No yield available to sweep")]
-    NothingToSweep,
+    #[msg("No excess available to skim")]
+    NothingToSkim,
     #[msg("There is no pending authority to accept")]
     NoPendingAuthority,
     #[msg("Signer is not the pending authority")]
