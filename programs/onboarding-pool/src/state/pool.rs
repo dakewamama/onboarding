@@ -4,6 +4,9 @@ use anchor_lang::prelude::*;
 #[derive(InitSpace)]
 pub struct Pool {
     pub authority: Pubkey,
+    /// Proposed next authority in the two-step rotation. `Pubkey::default()`
+    /// means no rotation is pending.
+    pub pending_authority: Pubkey,
     pub treasury: Pubkey,
     pub mint: Pubkey,
     pub seed: u64,

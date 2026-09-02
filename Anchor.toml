@@ -7,6 +7,9 @@ package_manager = "yarn"
 resolution = true
 skip-lint = false
 
+[test]
+startup_wait = 30000
+
 [programs.localnet]
 onboarding_pool = "FQ95QLushdus3WQv193HyedsVg3TGHqhw7dLpJtY5sgV"
 

@@ -14,6 +14,10 @@ pub enum PoolError {
     InvalidMint,
     #[msg("No yield available to sweep")]
     NothingToSweep,
+    #[msg("There is no pending authority to accept")]
+    NoPendingAuthority,
+    #[msg("Signer is not the pending authority")]
+    NotPendingAuthority,
     #[msg("Arithmetic overflow")]
     MathOverflow,
 }
