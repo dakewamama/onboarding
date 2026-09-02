@@ -29,8 +29,8 @@ pub struct Deposit<'info> {
     pub position: Account<'info, Position>,
     #[account(
         mut,
-        associated_token::mint = mint,
-        associated_token::authority = user,
+        token::mint = mint,
+        token::authority = user,
     )]
     pub user_ata: Account<'info, TokenAccount>,
     #[account(
