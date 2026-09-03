@@ -64,13 +64,30 @@ The receiver needs a public HTTPS URL so Paj can POST to it. `railway.json` +
 
 1. New Railway project from this GitHub repo (branch with these files). It picks up
    `railway.json` and builds `payments/Dockerfile`.
-2. Set service variables: `PAJ_API_KEY`, `PAJ_WEBHOOK_SECRET`, `PAJ_ENV=staging`,
-   `PAJ_MODE`, `PAJ_MINT`, `PAJ_CURRENCY`. Railway injects `PORT` automatically.
-3. Deploy, then grab the public domain. Your webhook URL is
-   `https://<app>.up.railway.app/webhooks/paj`.
-4. From anywhere with the API key, set `PAJ_WEBHOOK_URL` to that and run
-   `yarn run paj-verify-receiver` — it PATCHes the URL and fires `test-webhook`;
-   expect `delivered: true` (the receiver returns 200 to the signed sample).
+2. The receiver needs only `PAJ_WEBHOOK_SECRET` (to verify signatures). It makes NO
+   outbound calls, so DO NOT put the API key on the Railway box. Optionally set
+   `PAJ_MODE`. Railway injects `PORT`.
+3. Because the secret comes from registering the webhook, and registering needs the
+   URL, do it in this order:
+   a. Create the Railway service and generate the public domain (available before a
+      healthy boot). Webhook URL = `https://<app>.up.railway.app/webhooks/paj`.
+   b. From your own terminal (not the receiver host), register it and read back the
+      secret — this needs the API key, which stays on your machine:
+      ```bash
+      curl -X PATCH https://api.paj.cash/pub/v2/webhook \
+        -H 'content-type: application/json' -H 'x-api-key: <API KEY>' \
+        -d '{"rampWebhookURL":"https://<app>.up.railway.app/webhooks/paj"}'
+      ```
+      The response includes `webhookSecret` (`whsec_...`).
+   c. Put that `whsec_...` into Railway as `PAJ_WEBHOOK_SECRET`, then redeploy.
+4. Fire the test (also needs the API key, run from your terminal):
+   ```bash
+   curl -X POST 'https://api.paj.cash/pub/v2/webhook/test?type=RAMP' \
+     -H 'x-api-key: <API KEY>'
+   ```
+   Expect `delivered: true`. The Railway logs should show
+   `[webhook] 200 acknowledged; unknown pajId ... not credited`.
+   (`yarn run paj-verify-receiver` does steps 3b + 4 in one go if you prefer.)
 
 Note: Railway's container filesystem is ephemeral, so the file-based store
 (`orderReference<->pajId`, idempotency) resets on redeploy. For the webhook test

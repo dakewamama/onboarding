@@ -59,6 +59,9 @@ export class PajClient {
         if (v != null) url.searchParams.set(k, v);
       }
     }
+    if (!this.cfg.apiKey) {
+      throw new Error("PAJ_API_KEY is required for outbound Paj API calls");
+    }
     const res = await fetch(url.toString(), {
       method,
       headers: {

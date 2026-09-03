@@ -2,8 +2,11 @@ import * as path from "path";
 import { Chain, Currency, PaymentMode } from "./types";
 
 export interface PajConfig {
-  apiKey: string;
-  webhookSecret: string;
+  /** Only needed for OUTBOUND calls (createPayment, verify-receiver). The webhook
+   *  receiver does not use it, so it should not be set on the receiver host. */
+  apiKey?: string;
+  /** Needed by the receiver to verify signatures. Not needed for outbound-only use. */
+  webhookSecret?: string;
   env: "production" | "staging";
   mode: PaymentMode;
   chain: Chain;
@@ -25,12 +28,8 @@ export const BASE_URLS: Record<PajConfig["env"], string> = {
 const MAINNET_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): PajConfig {
-  const required = (k: string): string => {
-    const v = env[k];
-    if (!v) throw new Error(`missing required env var ${k}`);
-    return v;
-  };
-
+  // apiKey and webhookSecret are validated at point of use, not here: the
+  // receiver needs only the secret, outbound scripts need only the key.
   const envName = (env.PAJ_ENV ?? "staging").toLowerCase();
   if (envName !== "production" && envName !== "staging") {
     throw new Error(`PAJ_ENV must be "production" or "staging", got "${envName}"`);
@@ -42,8 +41,8 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): PajConfig {
   }
 
   return {
-    apiKey: required("PAJ_API_KEY"),
-    webhookSecret: required("PAJ_WEBHOOK_SECRET"),
+    apiKey: env.PAJ_API_KEY,
+    webhookSecret: env.PAJ_WEBHOOK_SECRET,
     env: envName,
     mode: mode as PaymentMode,
     chain: (env.PAJ_CHAIN ?? "SOLANA") as Chain,
