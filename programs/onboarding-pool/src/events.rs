@@ -31,3 +31,9 @@ pub struct ExcessSkimmed {
     pub amount: u64,
     pub total_principal: u64,
 }
+
+#[event]
+pub struct PositionClosed {
+    pub pool: Pubkey,
+    pub owner: Pubkey,
+}

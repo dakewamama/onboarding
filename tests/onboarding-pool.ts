@@ -133,6 +133,18 @@ describe("onboarding-pool", () => {
       .rpc();
   }
 
+  async function closePosition(userKp: Keypair) {
+    await program.methods
+      .closePosition()
+      .accountsPartial({
+        owner: userKp.publicKey,
+        rentReceiver: authority.publicKey,
+        position: derivePosition(userKp.publicKey),
+      })
+      .signers([userKp])
+      .rpc();
+  }
+
   async function assertSolvent() {
     const vaultAccount = await getAccount(provider.connection, vault);
     const poolAccount = await program.account.pool.fetch(pool);
@@ -392,6 +404,45 @@ describe("onboarding-pool", () => {
     assert.strictEqual(position.principal.toString(), "0");
     assert.isTrue(position.owner.equals(user.kp.publicKey));
 
+    await assertSolvent();
+  });
+
+  it("rejects closing a position that still holds principal", async () => {
+    const user = await createFundedUser(5_000_000n);
+    await deposit(user.kp, user.ata, new anchor.BN(1_000_000));
+
+    try {
+      await closePosition(user.kp);
+      assert.fail("expected PositionNotEmpty");
+    } catch (err) {
+      assert.include(err.toString(), "PositionNotEmpty");
+    }
+
+    await withdraw(user.kp, user.ata, new anchor.BN(1_000_000));
+    await assertSolvent();
+  });
+
+  it("closes an empty position and lets the owner redeposit fresh", async () => {
+    const user = await createFundedUser(5_000_000n);
+    await deposit(user.kp, user.ata, new anchor.BN(2_000_000));
+    await withdraw(user.kp, user.ata, new anchor.BN(2_000_000));
+
+    await closePosition(user.kp);
+    const closed = await program.account.position.fetchNullable(
+      derivePosition(user.kp.publicKey)
+    );
+    assert.isNull(closed);
+
+    // Redeposit reinitializes the position from scratch with the correct owner.
+    await deposit(user.kp, user.ata, new anchor.BN(1_000_000));
+    const reopened = await program.account.position.fetch(
+      derivePosition(user.kp.publicKey)
+    );
+    assert.strictEqual(reopened.principal.toString(), "1000000");
+    assert.isTrue(reopened.owner.equals(user.kp.publicKey));
+    assert.strictEqual(reopened.points.toString(), "0");
+
+    await withdraw(user.kp, user.ata, new anchor.BN(1_000_000));
     await assertSolvent();
   });
 

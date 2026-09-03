@@ -75,6 +75,10 @@ account already exists — so it takes only the `user` signer.
 The user's token account may be any account of the pool mint owned by the user; it
 need not be the associated token account.
 
+Once a position is fully withdrawn (`principal == 0`), the owner may call
+`close_position` to reclaim its rent to a chosen receiver. A later deposit simply
+reinitializes the position from scratch.
+
 ## Pool creation is permissionless
 
 `initialize_pool` takes a caller-chosen `seed` and is open to anyone. There is no
