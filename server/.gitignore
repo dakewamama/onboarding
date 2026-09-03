@@ -1,0 +1,5 @@
+# Custodial key material and audit logs must NEVER be committed.
+.keystore/
+.audit/
+node_modules/
+*.log
