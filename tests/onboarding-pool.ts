@@ -336,7 +336,7 @@ describe("onboarding-pool", () => {
     assert.isTrue(positionA.owner.equals(a.kp.publicKey));
   });
 
-  it("accrues units proportional to principal over elapsed time", async () => {
+  it("accrues points proportional to principal over elapsed time", async () => {
     const user = await createFundedUser(5_000_000n);
     const principal = new anchor.BN(1_000_000);
 
@@ -354,16 +354,16 @@ describe("onboarding-pool", () => {
 
     const elapsed = end.lastAccrual.sub(start.lastAccrual);
     const expected = principal.mul(elapsed);
-    const diff = end.accruedUnits.sub(expected).abs();
+    const diff = end.points.sub(expected).abs();
     assert.isTrue(
       diff.lte(principal),
-      `accrued ${end.accruedUnits} expected ~${expected}`
+      `accrued ${end.points} expected ~${expected}`
     );
 
     await assertSolvent();
   });
 
-  it("reduces principal and zeroes accrued units on a partial withdraw", async () => {
+  it("reduces principal but preserves points on a partial withdraw", async () => {
     const user = await createFundedUser(5_000_000n);
     await deposit(user.kp, user.ata, new anchor.BN(3_000_000));
 
@@ -374,7 +374,8 @@ describe("onboarding-pool", () => {
       derivePosition(user.kp.publicKey)
     );
     assert.strictEqual(position.principal.toString(), "2000000");
-    assert.strictEqual(position.accruedUnits.toString(), "0");
+    // Points are monotonic (invariant 4): a withdraw never resets them.
+    assert.isTrue(position.points.gt(new anchor.BN(0)));
 
     await assertSolvent();
   });
