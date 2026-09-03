@@ -11,6 +11,7 @@ import { loadConfig } from "./config";
 import { PajProvider } from "./pajProvider";
 import { handleWebhook } from "./webhookHandler";
 import { Settlement } from "./types";
+import { mountFunding } from "./funding/http";
 
 const cfg = loadConfig();
 if (!cfg.webhookSecret) {
@@ -29,13 +30,14 @@ async function credit(s: Settlement): Promise<void> {
   );
 }
 
-const server = http.createServer((req, res) => {
-  if (req.method !== "POST" || req.url !== "/webhooks/paj") {
-    res.writeHead(404).end();
-    return;
-  }
+// Additive crypto-funding routes (USDC on Solana). Started only when configured
+// (SOLANA_RPC_URL set); the Paj receiver runs unchanged either way. Returns a
+// handler that claims /funding/* requests and reports whether it handled one.
+const funding = mountFunding();
+
+async function handlePajWebhook(req: http.IncomingMessage, res: http.ServerResponse) {
   const chunks: Buffer[] = [];
-  req.on("data", (c) => chunks.push(c));
+  req.on("data", (c) => chunks.push(c as Buffer));
   req.on("end", async () => {
     const rawBody = Buffer.concat(chunks).toString("utf8");
     try {
@@ -48,10 +50,19 @@ const server = http.createServer((req, res) => {
       res.writeHead(500).end();
     }
   });
+}
+
+const server = http.createServer(async (req, res) => {
+  if (req.method === "POST" && req.url === "/webhooks/paj") {
+    return handlePajWebhook(req, res);
+  }
+  if (await funding.handle(req, res)) return; // /funding/* claimed it
+  res.writeHead(404).end();
 });
 
 server.listen(PORT, () => {
   console.log(
     `Paj webhook receiver on http://localhost:${PORT}/webhooks/paj (env=${cfg.env}, mode=${cfg.mode})`
   );
+  funding.logStatus(PORT);
 });

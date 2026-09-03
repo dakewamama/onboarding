@@ -6,10 +6,14 @@
     "custody-server": "ts-node server/src/http.ts",
     "paj-selfcheck": "ts-node --project payments/tsconfig.json payments/src/selfcheck.ts",
     "paj-webhook-server": "ts-node --project payments/tsconfig.json payments/src/server.ts",
-    "paj-verify-receiver": "ts-node --project payments/tsconfig.json payments/src/verifyReceiver.ts"
+    "paj-verify-receiver": "ts-node --project payments/tsconfig.json payments/src/verifyReceiver.ts",
+    "funding-selfcheck": "ts-node --project payments/tsconfig.json payments/src/funding/selfcheck.ts",
+    "funding-rpccheck": "ts-node --project payments/tsconfig.json payments/src/funding/rpccheck.ts"
   },
   "dependencies": {
-    "@coral-xyz/anchor": "0.32.1"
+    "@coral-xyz/anchor": "0.32.1",
+    "@solana/spl-token": "^0.4.9",
+    "@solana/web3.js": "^1.98.4"
   },
   "devDependencies": {
     "@solana/spl-token": "^0.4.9",

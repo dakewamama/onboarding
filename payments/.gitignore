@@ -3,4 +3,6 @@
 .env.*
 !.env.example
 .paj-store/
+# Durable crypto-funding deposit ledger + watchlist. This is money — never commit.
+.funding-store/
 *.log

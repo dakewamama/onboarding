@@ -1,14 +1,18 @@
-# Deploys ONLY the Paj webhook receiver (payments/src/server.ts).
+# Deploys payments/src/server.ts: the Paj webhook receiver AND (when
+# SOLANA_RPC_URL is set) the additive USDC-on-Solana crypto-funding routes.
 #
 # Build context is the repo root (see railway.json) so this can copy the root
-# tsconfig that payments/tsconfig.json extends. The receiver has no runtime npm
-# dependencies beyond ts-node + typescript + node types — it uses Node built-ins
-# and global fetch — so the Anchor/Solana toolchain is never installed here.
+# tsconfig that payments/tsconfig.json extends. The Paj receiver itself uses only
+# Node built-ins + fetch, but the crypto-funding flow reads the chain and builds
+# transfer transactions, so @solana/web3.js + @solana/spl-token are installed as
+# runtime deps here. The Anchor toolchain is still never installed.
 FROM node:20-slim
 WORKDIR /app
 
 RUN npm init -y >/dev/null 2>&1 \
-  && npm install --no-audit --no-fund ts-node@10 typescript@5 @types/node@20
+  && npm install --no-audit --no-fund \
+     ts-node@10 typescript@5 @types/node@20 \
+     @solana/web3.js@1 @solana/spl-token@0.4
 
 COPY tsconfig.json ./
 COPY payments ./payments
