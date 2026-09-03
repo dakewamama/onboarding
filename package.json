@@ -1,7 +1,9 @@
 {
   "scripts": {
     "test": "ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts",
-    "devnet-demo": "ts-node scripts/devnet-demo.ts"
+    "devnet-demo": "ts-node scripts/devnet-demo.ts",
+    "custody-demo": "ts-node server/src/demo.ts",
+    "custody-server": "ts-node server/src/http.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1"
@@ -11,6 +13,7 @@
     "@types/bn.js": "^5.1.0",
     "@types/chai": "^4.3.0",
     "@types/mocha": "^10.0.0",
+    "@types/node": "^20.0.0",
     "chai": "^4.3.4",
     "mocha": "^10.0.0",
     "ts-mocha": "^10.0.0",
