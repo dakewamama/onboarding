@@ -3,6 +3,7 @@ import { Program } from "@coral-xyz/anchor";
 import { OnboardingPool } from "../target/types/onboarding_pool";
 import {
   createMint,
+  createAccount,
   getAssociatedTokenAddress,
   getOrCreateAssociatedTokenAccount,
   getAccount,
@@ -121,7 +122,6 @@ describe("onboarding-pool", () => {
       .withdraw(amount)
       .accountsPartial({
         user: userKp.publicKey,
-        payer: authority.publicKey,
         mint,
         pool,
         position: derivePosition(userKp.publicKey),
@@ -390,6 +390,38 @@ describe("onboarding-pool", () => {
     );
     assert.strictEqual(position.principal.toString(), "0");
     assert.isTrue(position.owner.equals(user.kp.publicKey));
+
+    await assertSolvent();
+  });
+
+  it("deposits and withdraws through a non-ATA user token account", async () => {
+    const userKp = Keypair.generate();
+    // A plain token account owned by the user, not the associated token account.
+    const nonAta = await createAccount(
+      provider.connection,
+      (authority as anchor.Wallet).payer,
+      mint,
+      userKp.publicKey,
+      Keypair.generate()
+    );
+    await mintTo(
+      provider.connection,
+      (authority as anchor.Wallet).payer,
+      mint,
+      nonAta,
+      authority.publicKey,
+      2_000_000n
+    );
+
+    await deposit(userKp, nonAta, new anchor.BN(1_500_000));
+    const position = await program.account.position.fetch(
+      derivePosition(userKp.publicKey)
+    );
+    assert.strictEqual(position.principal.toString(), "1500000");
+
+    await withdraw(userKp, nonAta, new anchor.BN(1_500_000));
+    const account = await getAccount(provider.connection, nonAta);
+    assert.strictEqual(account.amount.toString(), "2000000");
 
     await assertSolvent();
   });

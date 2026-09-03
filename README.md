@@ -72,6 +72,9 @@ relayer builds the transaction, sets itself as `payer` and fee payer, collects t
 user's signature, and submits. `withdraw` needs no such split — the user's own
 account already exists — so it takes only the `user` signer.
 
+The user's token account may be any account of the pool mint owned by the user; it
+need not be the associated token account.
+
 ## Pool creation is permissionless
 
 `initialize_pool` takes a caller-chosen `seed` and is open to anyone. There is no
