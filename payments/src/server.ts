@@ -13,6 +13,12 @@ import { handleWebhook } from "./webhookHandler";
 import { Settlement } from "./types";
 
 const cfg = loadConfig();
+if (!cfg.webhookSecret) {
+  console.warn(
+    "[warn] PAJ_WEBHOOK_SECRET not set — every webhook will be rejected (400) until it is. " +
+      "Register the URL via PATCH /pub/v2/webhook, then set the returned whsec_ value here."
+  );
+}
 const provider = new PajProvider(cfg);
 const PORT = Number(process.env.PORT ?? 8788);
 

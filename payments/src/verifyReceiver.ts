@@ -14,6 +14,7 @@ import { PajClient } from "./pajClient";
 
 async function main() {
   const cfg = loadConfig();
+  if (!cfg.apiKey) throw new Error("set PAJ_API_KEY (this script makes outbound calls)");
   if (!cfg.webhookUrl) throw new Error("set PAJ_WEBHOOK_URL to your receiver URL");
 
   const client = new PajClient(cfg);
