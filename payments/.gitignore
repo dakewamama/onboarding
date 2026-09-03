@@ -1,0 +1,6 @@
+# Never commit keys or the local correlation/settlement store.
+.env
+.env.*
+!.env.example
+.paj-store/
+*.log

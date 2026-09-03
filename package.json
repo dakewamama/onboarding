@@ -3,7 +3,10 @@
     "test": "ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts",
     "devnet-demo": "ts-node scripts/devnet-demo.ts",
     "custody-demo": "ts-node server/src/demo.ts",
-    "custody-server": "ts-node server/src/http.ts"
+    "custody-server": "ts-node server/src/http.ts",
+    "paj-selfcheck": "ts-node --project payments/tsconfig.json payments/src/selfcheck.ts",
+    "paj-webhook-server": "ts-node --project payments/tsconfig.json payments/src/server.ts",
+    "paj-verify-receiver": "ts-node --project payments/tsconfig.json payments/src/verifyReceiver.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1"
