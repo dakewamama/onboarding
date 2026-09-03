@@ -19,8 +19,8 @@ Anchor 0.32.1 · Solana 2.3.0 · Rust 1.89.0
   (e.g. the protocol operator). The program does not produce yield; it holds
   deposits and lets the treasury collect whatever surplus is placed there.
 - A depositor's return is **points**: `principal × seconds held`, accumulated on
-  the Position. There is no claim instruction and no reward mint yet — points are
-  informational only. This is a known, documented gap, not a bug.
+  the Position. There is no claim instruction and no reward mint yet, so points
+  are informational only. This is a known, documented gap, not a bug.
 - Deposits support a **relayer**: the `payer` signer can differ from the `user`
   signer, so a wallet holding zero SOL can still deposit (someone else pays the
   fees and the Position rent).
@@ -61,16 +61,16 @@ make a test pass.
 
 `deposit` takes **two** signers:
 
-- `user` — owns the Position and authorizes the token transfer out of their token
+- `user`: owns the Position and authorizes the token transfer out of their token
   account.
-- `payer` — pays the transaction fee and the rent for the Position PDA on first
+- `payer`: pays the transaction fee and the rent for the Position PDA on first
   deposit.
 
 Because they are separate, a relayer can set `payer` to its own hot wallet while
 the user signs only for their funds. A user with no SOL can therefore onboard: the
 relayer builds the transaction, sets itself as `payer` and fee payer, collects the
-user's signature, and submits. `withdraw` needs no such split — the user's own
-account already exists — so it takes only the `user` signer.
+user's signature, and submits. `withdraw` needs no such split. The user's own
+account already exists, so it takes only the `user` signer.
 
 The user's token account may be any account of the pool mint owned by the user; it
 need not be the associated token account.
@@ -122,4 +122,4 @@ The wallet needs a little devnet SOL (`solana airdrop 2`).
 
 ## License
 
-MIT — see [LICENSE](LICENSE).
+MIT. See [LICENSE](LICENSE).
