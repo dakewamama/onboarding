@@ -98,8 +98,8 @@ describe("onboarding-pool", () => {
       .rpc();
   }
 
-  async function sweep(treasuryAccount: PublicKey, signer?: Keypair) {
-    const builder = program.methods.sweepYield().accountsPartial({
+  async function skim(treasuryAccount: PublicKey, signer?: Keypair) {
+    const builder = program.methods.skimExcess().accountsPartial({
       authority: signer ? signer.publicKey : authority.publicKey,
       mint,
       pool,
@@ -440,18 +440,18 @@ describe("onboarding-pool", () => {
     await assertSolvent();
   });
 
-  it("rejects a sweep when there is no excess", async () => {
+  it("rejects a skim when there is no excess", async () => {
     try {
-      await sweep(treasury);
-      assert.fail("expected NothingToSweep");
+      await skim(treasury);
+      assert.fail("expected NothingToSkim");
     } catch (err) {
-      assert.include(err.toString(), "NothingToSweep");
+      assert.include(err.toString(), "NothingToSkim");
     }
 
     await assertSolvent();
   });
 
-  it("sweeps excess above the margin and leaves principal untouched", async () => {
+  it("skims the full excess and leaves principal untouched", async () => {
     const injected = 10_000n;
     await mintTo(
       provider.connection,
@@ -465,15 +465,16 @@ describe("onboarding-pool", () => {
     const poolBefore = await program.account.pool.fetch(pool);
     const treasuryBefore = await getAccount(provider.connection, treasury);
 
-    await sweep(treasury);
+    await skim(treasury);
 
     const poolAfter = await program.account.pool.fetch(pool);
     const treasuryAfter = await getAccount(provider.connection, treasury);
 
-    const expectedSwept = injected - 1_000n;
+    // The whole surplus is skimmed; there is no retained margin.
+    const expectedSkimmed = injected;
     assert.strictEqual(
       (treasuryAfter.amount - treasuryBefore.amount).toString(),
-      expectedSwept.toString()
+      expectedSkimmed.toString()
     );
     assert.strictEqual(
       poolAfter.totalPrincipal.toString(),
@@ -483,10 +484,10 @@ describe("onboarding-pool", () => {
     await assertSolvent();
   });
 
-  it("rejects a sweep from a non authority", async () => {
+  it("rejects a skim from a non authority", async () => {
     const intruder = Keypair.generate();
     try {
-      await sweep(treasury, intruder);
+      await skim(treasury, intruder);
       assert.fail("expected a has_one violation");
     } catch (err) {
       assert.include(err.toString(), "ConstraintHasOne");
@@ -495,7 +496,7 @@ describe("onboarding-pool", () => {
     await assertSolvent();
   });
 
-  it("rejects a sweep to a treasury other than the pool treasury", async () => {
+  it("rejects a skim to a treasury other than the pool treasury", async () => {
     const wrong = await getOrCreateAssociatedTokenAccount(
       provider.connection,
       (authority as anchor.Wallet).payer,
@@ -504,7 +505,7 @@ describe("onboarding-pool", () => {
     );
 
     try {
-      await sweep(wrong.address);
+      await skim(wrong.address);
       assert.fail("expected InvalidTreasury");
     } catch (err) {
       assert.include(err.toString(), "InvalidTreasury");
@@ -513,7 +514,7 @@ describe("onboarding-pool", () => {
     await assertSolvent();
   });
 
-  it("blocks deposit and sweep while paused but never withdraw", async () => {
+  it("blocks deposit and skim while paused but never withdraw", async () => {
     const user = await createFundedUser(5_000_000n);
     await deposit(user.kp, user.ata, new anchor.BN(2_000_000));
 
@@ -527,8 +528,8 @@ describe("onboarding-pool", () => {
     }
 
     try {
-      await sweep(treasury);
-      assert.fail("expected Paused on sweep");
+      await skim(treasury);
+      assert.fail("expected Paused on skim");
     } catch (err) {
       assert.include(err.toString(), "Paused");
     }
