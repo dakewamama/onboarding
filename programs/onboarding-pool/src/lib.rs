@@ -36,4 +36,12 @@ pub mod onboarding_pool {
     pub fn set_treasury(ctx: Context<SetTreasury>, treasury: Pubkey) -> Result<()> {
         ctx.accounts.set_treasury(treasury)
     }
+
+    pub fn propose_authority(ctx: Context<ProposeAuthority>, new_authority: Pubkey) -> Result<()> {
+        ctx.accounts.propose_authority(new_authority)
+    }
+
+    pub fn accept_authority(ctx: Context<AcceptAuthority>) -> Result<()> {
+        ctx.accounts.accept_authority()
+    }
 }

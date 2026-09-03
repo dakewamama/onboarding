@@ -49,3 +49,49 @@ impl<'info> SetTreasury<'info> {
         Ok(())
     }
 }
+
+#[derive(Accounts)]
+pub struct ProposeAuthority<'info> {
+    pub authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"pool", pool.seed.to_le_bytes().as_ref()],
+        bump = pool.bump,
+        has_one = authority,
+    )]
+    pub pool: Account<'info, Pool>,
+}
+
+impl<'info> ProposeAuthority<'info> {
+    pub fn propose_authority(&mut self, new_authority: Pubkey) -> Result<()> {
+        self.pool.pending_authority = new_authority;
+        Ok(())
+    }
+}
+
+#[derive(Accounts)]
+pub struct AcceptAuthority<'info> {
+    pub new_authority: Signer<'info>,
+    #[account(
+        mut,
+        seeds = [b"pool", pool.seed.to_le_bytes().as_ref()],
+        bump = pool.bump,
+    )]
+    pub pool: Account<'info, Pool>,
+}
+
+impl<'info> AcceptAuthority<'info> {
+    pub fn accept_authority(&mut self) -> Result<()> {
+        require!(
+            self.pool.pending_authority != Pubkey::default(),
+            PoolError::NoPendingAuthority
+        );
+        require!(
+            self.pool.pending_authority == self.new_authority.key(),
+            PoolError::NotPendingAuthority
+        );
+        self.pool.authority = self.new_authority.key();
+        self.pool.pending_authority = Pubkey::default();
+        Ok(())
+    }
+}
