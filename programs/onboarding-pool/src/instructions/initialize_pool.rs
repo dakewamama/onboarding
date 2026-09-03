@@ -40,6 +40,7 @@ impl<'info> InitializePool<'info> {
     pub fn initialize_pool(&mut self, seed: u64, bumps: InitializePoolBumps) -> Result<()> {
         self.pool.set_inner(Pool {
             authority: self.authority.key(),
+            pending_authority: Pubkey::default(),
             treasury: self.treasury.key(),
             mint: self.mint.key(),
             seed,

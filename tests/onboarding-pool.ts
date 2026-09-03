@@ -551,4 +551,99 @@ describe("onboarding-pool", () => {
       assert.include(err.toString(), "ConstraintTokenMint");
     }
   });
+
+  it("rotates authority via two-step propose and accept", async () => {
+    // Isolated pool so rotating authority does not disturb the shared suite.
+    const rSeed = new anchor.BN(3);
+    const rPool = derivePool(rSeed);
+    const rVault = await getAssociatedTokenAddress(mint, rPool, true);
+    await program.methods
+      .initializePool(rSeed)
+      .accountsPartial({
+        authority: authority.publicKey,
+        mint,
+        treasury,
+        pool: rPool,
+        vault: rVault,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+
+    const next = Keypair.generate();
+
+    // a non-authority cannot propose
+    const intruder = Keypair.generate();
+    try {
+      await program.methods
+        .proposeAuthority(next.publicKey)
+        .accountsPartial({ authority: intruder.publicKey, pool: rPool })
+        .signers([intruder])
+        .rpc();
+      assert.fail("expected ConstraintHasOne on propose");
+    } catch (err) {
+      assert.include(err.toString(), "ConstraintHasOne");
+    }
+
+    // accept with no pending proposal is rejected
+    try {
+      await program.methods
+        .acceptAuthority()
+        .accountsPartial({ newAuthority: next.publicKey, pool: rPool })
+        .signers([next])
+        .rpc();
+      assert.fail("expected NoPendingAuthority");
+    } catch (err) {
+      assert.include(err.toString(), "NoPendingAuthority");
+    }
+
+    // current authority proposes the next one
+    await program.methods
+      .proposeAuthority(next.publicKey)
+      .accountsPartial({ authority: authority.publicKey, pool: rPool })
+      .rpc();
+
+    // accept by the wrong key is rejected
+    const wrong = Keypair.generate();
+    try {
+      await program.methods
+        .acceptAuthority()
+        .accountsPartial({ newAuthority: wrong.publicKey, pool: rPool })
+        .signers([wrong])
+        .rpc();
+      assert.fail("expected NotPendingAuthority");
+    } catch (err) {
+      assert.include(err.toString(), "NotPendingAuthority");
+    }
+
+    // the pending authority accepts
+    await program.methods
+      .acceptAuthority()
+      .accountsPartial({ newAuthority: next.publicKey, pool: rPool })
+      .signers([next])
+      .rpc();
+
+    let p = await program.account.pool.fetch(rPool);
+    assert.isTrue(p.authority.equals(next.publicKey));
+    assert.isTrue(p.pendingAuthority.equals(PublicKey.default));
+
+    // authority-gated instructions now follow the new authority and reject the old
+    try {
+      await program.methods
+        .setPaused(true)
+        .accountsPartial({ authority: authority.publicKey, pool: rPool })
+        .rpc();
+      assert.fail("expected ConstraintHasOne for the old authority");
+    } catch (err) {
+      assert.include(err.toString(), "ConstraintHasOne");
+    }
+
+    await program.methods
+      .setPaused(true)
+      .accountsPartial({ authority: next.publicKey, pool: rPool })
+      .signers([next])
+      .rpc();
+    p = await program.account.pool.fetch(rPool);
+    assert.strictEqual(p.paused, true);
+  });
 });
