@@ -57,6 +57,26 @@ yarn run paj-webhook-server   # receiver on :8788 /webhooks/paj (verifies signat
 yarn run paj-verify-receiver  # PATCH your webhook URL + POST test-webhook to confirm delivery
 ```
 
+## Deploy the receiver (Railway)
+
+The receiver needs a public HTTPS URL so Paj can POST to it. `railway.json` +
+`payments/Dockerfile` build **only** the receiver (no Anchor/Solana toolchain).
+
+1. New Railway project from this GitHub repo (branch with these files). It picks up
+   `railway.json` and builds `payments/Dockerfile`.
+2. Set service variables: `PAJ_API_KEY`, `PAJ_WEBHOOK_SECRET`, `PAJ_ENV=staging`,
+   `PAJ_MODE`, `PAJ_MINT`, `PAJ_CURRENCY`. Railway injects `PORT` automatically.
+3. Deploy, then grab the public domain. Your webhook URL is
+   `https://<app>.up.railway.app/webhooks/paj`.
+4. From anywhere with the API key, set `PAJ_WEBHOOK_URL` to that and run
+   `yarn run paj-verify-receiver` — it PATCHes the URL and fires `test-webhook`;
+   expect `delivered: true` (the receiver returns 200 to the signed sample).
+
+Note: Railway's container filesystem is ephemeral, so the file-based store
+(`orderReference<->pajId`, idempotency) resets on redeploy. For the webhook test
+that's fine. For real settlement correlation, attach a Railway volume and point
+`PAJ_STORE_DIR` at it, or swap the store for a database.
+
 ## Gotchas baked in (from v1 experience, verified against v2)
 
 - Staging and production keys are provisioned separately (a prod key 404s/400s on
