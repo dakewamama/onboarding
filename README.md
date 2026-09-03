@@ -104,6 +104,9 @@ cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 ```
 
+These same checks run in CI (`.github/workflows/ci.yml`) on every push and pull
+request.
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
