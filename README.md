@@ -3,7 +3,7 @@
 A **protocol-revenue deposit vault** with sponsored onboarding and a time-weighted
 points ledger, built with Anchor on Solana.
 
-Program ID: `FQ95QLushdus3WQv193HyedsVg3TGHqhw7dLpJtY5sgV`
+Program ID: `FQ95QLushdus3WQv193HyedsVg3TGHqhw7dLpJtY5sgV` (deployed to **devnet**)
 Anchor 0.32.1 · Solana 2.3.0 · Rust 1.89.0
 
 ## What this is
@@ -106,6 +106,19 @@ cargo clippy --all-targets -- -D warnings
 
 These same checks run in CI (`.github/workflows/ci.yml`) on every push and pull
 request.
+
+## Devnet
+
+The program is deployed to devnet at the program ID above. An end-to-end smoke
+script exercises initialize → deposit → withdraw → skim against the live program:
+
+```bash
+ANCHOR_PROVIDER_URL=https://api.devnet.solana.com \
+ANCHOR_WALLET=~/.config/solana/id.json \
+yarn run ts-node scripts/devnet-demo.ts
+```
+
+The wallet needs a little devnet SOL (`solana airdrop 2`).
 
 ## License
 
