@@ -18,6 +18,8 @@ pub enum PoolError {
     NoPendingAuthority,
     #[msg("Signer is not the pending authority")]
     NotPendingAuthority,
+    #[msg("Position still holds principal and cannot be closed")]
+    PositionNotEmpty,
     #[msg("Arithmetic overflow")]
     MathOverflow,
 }
