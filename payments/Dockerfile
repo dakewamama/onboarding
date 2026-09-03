@@ -21,4 +21,13 @@ COPY payments ./payments
 ENV PORT=8080
 EXPOSE 8080
 
+# The crypto-funding deposit ledger is money: it must survive redeploys, not just
+# process restarts. Default its store to /data and mark that a volume, so on
+# Railway you attach a persistent volume at /data (Service -> Variables/Volumes ->
+# mount path /data) and the ledger persists across deploys. Without a volume this
+# path is still just ephemeral container disk, so DO attach one before mainnet.
+# Override with FUNDING_STORE_DIR if you mount elsewhere.
+ENV FUNDING_STORE_DIR=/data
+VOLUME ["/data"]
+
 CMD ["npx", "ts-node", "--project", "payments/tsconfig.json", "payments/src/server.ts"]
