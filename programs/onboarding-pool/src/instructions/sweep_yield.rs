@@ -31,6 +31,7 @@ pub struct SweepYield<'info> {
 
 impl<'info> SweepYield<'info> {
     pub fn sweep_yield(&mut self) -> Result<()> {
+        require!(!self.pool.paused, PoolError::Paused);
         require!(
             self.treasury.key() == self.pool.treasury,
             PoolError::InvalidTreasury
@@ -53,11 +54,8 @@ impl<'info> SweepYield<'info> {
     }
 
     pub fn sweep_tokens(&self, amount: u64) -> Result<()> {
-        let signer_seeds: &[&[&[u8]]] = &[&[
-            b"pool",
-            &self.pool.seed.to_le_bytes(),
-            &[self.pool.bump],
-        ]];
+        let signer_seeds: &[&[&[u8]]] =
+            &[&[b"pool", &self.pool.seed.to_le_bytes(), &[self.pool.bump]]];
 
         let cpi_program = self.token_program.to_account_info();
 
