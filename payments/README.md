@@ -94,6 +94,27 @@ Note: Railway's container filesystem is ephemeral, so the file-based store
 that's fine. For real settlement correlation, attach a Railway volume and point
 `PAJ_STORE_DIR` at it, or swap the store for a database.
 
+## Crypto funding (USDC on Solana) + persistent volume
+
+The same service also serves the additive USDC-funding routes (`/funding/*`) when
+`SOLANA_RPC_URL` is set (otherwise inert; Paj runs unchanged). Env: `SOLANA_RPC_URL`,
+`SOLANA_USDC_MINT`, `SOLANA_COMMITMENT`, `FUNDING_CORS_ORIGINS` (the browser
+frontend's origin).
+
+The funding **deposit ledger is money** — it's what makes crediting idempotent on
+the tx signature and remembers deposits across restarts. It must survive redeploys,
+not just process restarts. The image defaults `FUNDING_STORE_DIR=/data` and marks
+`/data` a `VOLUME`, so:
+
+1. In the Railway service, add a **Volume** with mount path **`/data`**.
+2. Leave `FUNDING_STORE_DIR` unset (image default `/data`), or set it to your mount
+   path if different.
+
+Without a mounted volume, `/data` is still just ephemeral container disk and a
+redeploy can lose or re-credit real deposits. Attach the volume before mainnet, or
+swap the file store for a DB (the atomic `wx`-per-signature contract maps directly
+to a `UNIQUE` constraint on the signature).
+
 ## Gotchas baked in (from v1 experience, verified against v2)
 
 - Staging and production keys are provisioned separately (a prod key 404s/400s on
