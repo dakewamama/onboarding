@@ -56,7 +56,7 @@ impl<'info> Deposit<'info> {
                 owner: self.user.key(),
                 pool: self.pool.key(),
                 principal: 0,
-                accrued_units: 0,
+                points: 0,
                 last_accrual: now,
                 bump: bumps.position,
             });
