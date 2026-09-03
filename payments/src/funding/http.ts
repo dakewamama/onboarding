@@ -30,12 +30,38 @@ export function mountFunding(): FundingMount {
     disabledReason = (err as Error).message;
   }
 
+  // Resolve the CORS origin to echo for this request against the configured
+  // allowlist. Returns null when the request origin isn't allowed (no header set).
+  function allowedOrigin(reqOrigin: string | undefined): string | null {
+    const allow = service ? service.config.corsOrigins : [];
+    if (allow.length === 0) return null;
+    if (allow.includes("*")) return "*";
+    return reqOrigin && allow.includes(reqOrigin) ? reqOrigin : null;
+  }
+
   async function handle(
     req: http.IncomingMessage,
     res: http.ServerResponse
   ): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (!url.pathname.startsWith("/funding/")) return false;
+
+    // CORS: the browser frontend (Vercel) calls this backend (Railway) cross-origin.
+    const origin = allowedOrigin(
+      Array.isArray(req.headers.origin) ? req.headers.origin[0] : req.headers.origin
+    );
+    if (origin) {
+      res.setHeader("Access-Control-Allow-Origin", origin);
+      res.setHeader("Vary", "Origin");
+      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+      res.setHeader("Access-Control-Allow-Headers", "content-type");
+      res.setHeader("Access-Control-Max-Age", "86400");
+    }
+    // Answer the preflight before any routing/auth.
+    if (req.method === "OPTIONS") {
+      res.writeHead(origin ? 204 : 403).end();
+      return true;
+    }
 
     if (!service) {
       send(res, 503, { error: "crypto funding not configured", detail: disabledReason });
