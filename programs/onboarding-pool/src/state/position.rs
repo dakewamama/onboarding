@@ -8,7 +8,11 @@ pub struct Position {
     pub owner: Pubkey,
     pub pool: Pubkey,
     pub principal: u64,
-    pub accrued_units: u128,
+    /// Accumulated points, measured in token-seconds (`principal × seconds`).
+    /// This is purely informational: it is the return the protocol tracks for a
+    /// position, monotonically increasing while principal sits in the pool. There
+    /// is no claim path and points mint no reward — nothing on-chain spends them.
+    pub points: u128,
     pub last_accrual: i64,
     pub bump: u8,
 }
@@ -26,8 +30,8 @@ pub fn accrue(position: &mut Position, now: i64) -> Result<()> {
         let delta = (position.principal as u128)
             .checked_mul(elapsed as u128)
             .ok_or(PoolError::MathOverflow)?;
-        position.accrued_units = position
-            .accrued_units
+        position.points = position
+            .points
             .checked_add(delta)
             .ok_or(PoolError::MathOverflow)?;
         position.last_accrual = now;
@@ -44,7 +48,7 @@ mod tests {
             owner: Pubkey::default(),
             pool: Pubkey::default(),
             principal,
-            accrued_units: 0,
+            points: 0,
             last_accrual,
             bump: 0,
         }
@@ -54,7 +58,7 @@ mod tests {
     fn accrues_forward() {
         let mut p = position(100, 0);
         accrue(&mut p, 10).unwrap();
-        assert_eq!(p.accrued_units, 1_000);
+        assert_eq!(p.points, 1_000);
         assert_eq!(p.last_accrual, 10);
     }
 
@@ -63,7 +67,7 @@ mod tests {
         let mut p = position(100, 10);
         accrue(&mut p, 4).unwrap();
         // Clock rewound: nothing accrues and the checkpoint stays put.
-        assert_eq!(p.accrued_units, 0);
+        assert_eq!(p.points, 0);
         assert_eq!(p.last_accrual, 10);
     }
 
@@ -74,7 +78,7 @@ mod tests {
         accrue(&mut p, 4).unwrap();
         accrue(&mut p, 15).unwrap();
         // Only the 10 -> 15 interval counts, not 4 -> 15.
-        assert_eq!(p.accrued_units, 500);
+        assert_eq!(p.points, 500);
         assert_eq!(p.last_accrual, 15);
     }
 }

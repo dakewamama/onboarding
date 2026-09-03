@@ -51,8 +51,8 @@ impl<'info> Withdraw<'info> {
             PoolError::InsufficientPrincipal
         );
 
-        self.position.accrued_units = 0;
-
+        // Points are never reset on withdraw: they are monotonic (invariant 4)
+        // and informational. Reducing principal simply slows future accrual.
         self.withdraw_tokens(amount)?;
 
         self.position.principal = self
