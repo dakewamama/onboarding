@@ -25,7 +25,7 @@ pub struct Withdrawn {
 }
 
 #[event]
-pub struct YieldSwept {
+pub struct ExcessSkimmed {
     pub pool: Pubkey,
     pub treasury: Pubkey,
     pub amount: u64,

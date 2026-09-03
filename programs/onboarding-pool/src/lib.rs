@@ -25,8 +25,8 @@ pub mod onboarding_pool {
         ctx.accounts.withdraw(amount)
     }
 
-    pub fn sweep_yield(ctx: Context<SweepYield>) -> Result<()> {
-        ctx.accounts.sweep_yield()
+    pub fn skim_excess(ctx: Context<SkimExcess>) -> Result<()> {
+        ctx.accounts.skim_excess()
     }
 
     pub fn set_paused(ctx: Context<SetPaused>, paused: bool) -> Result<()> {
