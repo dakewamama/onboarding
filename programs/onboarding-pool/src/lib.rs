@@ -25,6 +25,10 @@ pub mod onboarding_pool {
         ctx.accounts.withdraw(amount)
     }
 
+    pub fn close_position(ctx: Context<ClosePosition>) -> Result<()> {
+        ctx.accounts.close_position()
+    }
+
     pub fn skim_excess(ctx: Context<SkimExcess>) -> Result<()> {
         ctx.accounts.skim_excess()
     }
