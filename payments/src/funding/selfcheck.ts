@@ -9,8 +9,11 @@ import * as assert from "assert";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
+import { Connection, Transaction } from "@solana/web3.js";
 import { toBaseUnits, fromBaseUnits } from "../money";
 import { DepositLedger } from "./depositLedger";
+import { TransferBuilder } from "./transferBuilder";
+import { FundingConfig } from "./config";
 
 let passed = 0;
 function check(name: string, fn: () => void | Promise<void>): Promise<void> {
@@ -74,6 +77,40 @@ async function main() {
     assert.strictEqual(toBaseUnits("1").toString(), "1000000");
     assert.throws(() => toBaseUnits("0.0000001")); // 7 dp > 6
     assert.throws(() => toBaseUnits("1.2.3"));
+  });
+
+  // --- connect-and-approve: transaction is built UNSIGNED (stub RPC) ---
+  const fundingCfg: FundingConfig = {
+    rpcUrl: "http://stub",
+    usdcMint: "4zMMC9srt5Ri5X14GAgXhaHii3GnPAEERYPJgZJDncDU",
+    commitment: "finalized",
+    pollIntervalMs: 15000,
+    pageSize: 25,
+    storeDir: tmpDir(),
+  };
+  // Only getLatestBlockhash is exercised; stub it so this stays offline.
+  const stubConn = {
+    getLatestBlockhash: async () => ({
+      blockhash: "11111111111111111111111111111111",
+      lastValidBlockHeight: 0,
+    }),
+  } as unknown as Connection;
+
+  await check("build-transfer returns an UNSIGNED 2-instruction tx paid by the user", async () => {
+    const builder = new TransferBuilder(fundingCfg, stubConn);
+    const built = await builder.build(OWNER, OWNER, "1.5");
+    assert.strictEqual(built.baseUnits, "1500000"); // 1.5 USDC, integer base units
+    const tx = Transaction.from(Buffer.from(built.transactionBase64, "base64"));
+    assert.strictEqual(tx.instructions.length, 2); // create-idempotent + transferChecked
+    assert.strictEqual(tx.feePayer?.toBase58(), OWNER); // the user's own wallet pays
+    assert.strictEqual(tx.signatures.filter((s) => s.signature).length, 0); // never signed for them
+    assert.ok(tx.recentBlockhash);
+  });
+
+  await check("build-transfer rejects over-precision and non-positive amounts", async () => {
+    const builder = new TransferBuilder(fundingCfg, stubConn);
+    await assert.rejects(() => builder.build(OWNER, OWNER, "1.0000001")); // 7 dp
+    await assert.rejects(() => builder.build(OWNER, OWNER, "0")); // nothing to send
   });
 
   console.log(`\n${passed} checks passed`);

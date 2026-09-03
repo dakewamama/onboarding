@@ -1,7 +1,9 @@
+import { Connection } from "@solana/web3.js";
 import { fromBaseUnits, toBaseUnits } from "../money";
 import { FundingConfig, loadFundingConfig } from "./config";
 import { DepositLedger, CreditRecord } from "./depositLedger";
 import { UsdcWatcher } from "./usdcWatcher";
+import { TransferBuilder, BuiltTransfer } from "./transferBuilder";
 
 export interface DepositAddress {
   /** The user's Axis wallet address — where they send USDC. */
@@ -25,6 +27,7 @@ export class FundingService {
   readonly config: FundingConfig;
   readonly ledger: DepositLedger;
   readonly watcher: UsdcWatcher;
+  readonly builder: TransferBuilder;
 
   constructor(
     config: FundingConfig = loadFundingConfig(),
@@ -32,7 +35,9 @@ export class FundingService {
   ) {
     this.config = config;
     this.ledger = new DepositLedger(config.storeDir);
-    this.watcher = new UsdcWatcher(config, this.ledger, onCredit);
+    const connection = new Connection(config.rpcUrl, config.commitment);
+    this.watcher = new UsdcWatcher(config, this.ledger, onCredit, connection);
+    this.builder = new TransferBuilder(config, connection);
   }
 
   /** Start the background deposit watcher. */
@@ -60,6 +65,20 @@ export class FundingService {
       qr: `solana:${owner}?spl-token=${this.config.usdcMint}`,
       requiredCommitment: this.config.commitment,
     };
+  }
+
+  /**
+   * Build an UNSIGNED USDC transfer from the user's connected wallet to their
+   * Axis wallet, for them to approve in their own wallet. Arms the watch on the
+   * destination so the deposit is credited once it confirms. Never signs.
+   */
+  async buildTransfer(
+    fromWallet: string,
+    owner: string,
+    amountUsdc: string
+  ): Promise<BuiltTransfer> {
+    this.watcher.watch(owner);
+    return this.builder.build(fromWallet, owner, amountUsdc);
   }
 
   /** Durably-credited balance for a user, as a canonical decimal USDC string. */

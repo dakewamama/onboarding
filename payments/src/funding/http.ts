@@ -9,9 +9,10 @@ import { loadFundingConfig } from "./config";
  * inert — the Paj receiver keeps working untouched, and /funding/* returns 503.
  *
  * Routes (step 1 — deposit-address display + credit-on-confirmation):
- *   POST /funding/address     { owner }            -> deposit address + QR, arms the watch
- *   GET  /funding/balance     ?owner=              -> durably-credited USDC balance
- *   GET  /funding/deposits    ?owner=              -> credited deposit history
+ *   POST /funding/address        { owner }                       -> address + QR, arms watch
+ *   POST /funding/build-transfer { fromWallet, owner, amountUsdc } -> unsigned tx (base64)
+ *   GET  /funding/balance        ?owner=                         -> durably-credited balance
+ *   GET  /funding/deposits       ?owner=                         -> credited deposit history
  */
 export interface FundingMount {
   handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean>;
@@ -47,6 +48,20 @@ export function mountFunding(): FundingMount {
         const owner = String((body as any).owner ?? "");
         if (!owner) return void send(res, 400, { error: "owner is required" }), true;
         send(res, 200, service.issueDepositAddress(owner));
+        return true;
+      }
+
+      if (req.method === "POST" && url.pathname === "/funding/build-transfer") {
+        const body = (await readJson(req)) as any;
+        const fromWallet = String(body.fromWallet ?? "");
+        const owner = String(body.owner ?? "");
+        const amountUsdc = String(body.amountUsdc ?? "");
+        if (!fromWallet || !owner || !amountUsdc) {
+          return void send(res, 400, {
+            error: "fromWallet, owner and amountUsdc are required",
+          }), true;
+        }
+        send(res, 200, await service.buildTransfer(fromWallet, owner, amountUsdc));
         return true;
       }
 
