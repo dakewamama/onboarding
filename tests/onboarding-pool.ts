@@ -20,13 +20,18 @@ describe("onboarding-pool", () => {
 
   const program = anchor.workspace.OnboardingPool as Program<OnboardingPool>;
   const authority = provider.wallet;
+  const payer = (authority as anchor.Wallet).payer;
 
-  const seed = new anchor.BN(1);
-
+  // One shared asset; every test gets its own pool, so nothing bleeds across
+  // tests. Seeds are handed out from a monotonic counter.
   let mint: PublicKey;
-  let treasury: PublicKey;
+  let seedCounter = 1;
+
+  // Per-test state, reset in beforeEach.
+  let seed: anchor.BN;
   let pool: PublicKey;
   let vault: PublicKey;
+  let treasury: PublicKey;
 
   const derivePool = (s: anchor.BN) =>
     PublicKey.findProgramAddressSync(
@@ -34,39 +39,87 @@ describe("onboarding-pool", () => {
       program.programId
     )[0];
 
-  const derivePosition = (owner: PublicKey) =>
+  const derivePosition = (owner: PublicKey, poolKey: PublicKey = pool) =>
     PublicKey.findProgramAddressSync(
-      [Buffer.from("position"), pool.toBuffer(), owner.toBuffer()],
+      [Buffer.from("position"), poolKey.toBuffer(), owner.toBuffer()],
       program.programId
     )[0];
 
   const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 
-  async function createFundedUser(amount: bigint) {
-    const kp = Keypair.generate();
-    const ata = await getOrCreateAssociatedTokenAccount(
-      provider.connection,
-      (authority as anchor.Wallet).payer,
-      mint,
-      kp.publicKey
-    );
-    await mintTo(
-      provider.connection,
-      (authority as anchor.Wallet).payer,
-      mint,
-      ata.address,
-      authority.publicKey,
-      amount
-    );
-    return { kp, ata: ata.address };
+  const nextSeed = () => new anchor.BN(seedCounter++);
+
+  // Asserts that `promise` rejects with a specific Anchor error code (program
+  // error name or built-in constraint name), not a brittle substring.
+  async function expectError(promise: Promise<unknown>, code: string) {
+    try {
+      await promise;
+      assert.fail(`expected error ${code}`);
+    } catch (err) {
+      if (err instanceof anchor.AnchorError) {
+        assert.strictEqual(
+          err.error.errorCode.code,
+          code,
+          `expected ${code}, got ${err.error.errorCode.code}`
+        );
+      } else {
+        throw err;
+      }
+    }
   }
 
-  async function deposit(
-    userKp: Keypair,
-    userAta: PublicKey,
-    amount: anchor.BN
+  // Asserts that `promise` rejects at all — used where the failure comes from the
+  // SPL token program (not an Anchor error with a stable code).
+  async function expectReject(promise: Promise<unknown>) {
+    try {
+      await promise;
+      assert.fail("expected the call to reject");
+    } catch (err) {
+      if (err instanceof Error && err.message.startsWith("expected the call")) {
+        throw err;
+      }
+    }
+  }
+
+  async function freshTokenAccount(owner: PublicKey) {
+    const account = await getOrCreateAssociatedTokenAccount(
+      provider.connection,
+      payer,
+      mint,
+      owner
+    );
+    return account.address;
+  }
+
+  async function createFundedUser(amount: bigint) {
+    const kp = Keypair.generate();
+    const ata = await freshTokenAccount(kp.publicKey);
+    await mintTo(provider.connection, payer, mint, ata, authority.publicKey, amount);
+    return { kp, ata };
+  }
+
+  async function initializePool(
+    s: anchor.BN,
+    poolKey: PublicKey,
+    vaultKey: PublicKey,
+    treasuryKey: PublicKey
   ) {
     await program.methods
+      .initializePool(s)
+      .accountsPartial({
+        authority: authority.publicKey,
+        mint,
+        treasury: treasuryKey,
+        pool: poolKey,
+        vault: vaultKey,
+        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+        tokenProgram: TOKEN_PROGRAM_ID,
+      })
+      .rpc();
+  }
+
+  function deposit(userKp: Keypair, userAta: PublicKey, amount: anchor.BN) {
+    return program.methods
       .deposit(amount)
       .accountsPartial({
         user: userKp.publicKey,
@@ -84,41 +137,8 @@ describe("onboarding-pool", () => {
       .rpc();
   }
 
-  async function setPaused(paused: boolean) {
-    await program.methods
-      .setPaused(paused)
-      .accountsPartial({ authority: authority.publicKey, pool })
-      .rpc();
-  }
-
-  async function setTreasury(newTreasury: PublicKey) {
-    await program.methods
-      .setTreasury(newTreasury)
-      .accountsPartial({ authority: authority.publicKey, mint, pool, newTreasury })
-      .rpc();
-  }
-
-  async function skim(treasuryAccount: PublicKey, signer?: Keypair) {
-    const builder = program.methods.skimExcess().accountsPartial({
-      authority: signer ? signer.publicKey : authority.publicKey,
-      mint,
-      pool,
-      vault,
-      treasury: treasuryAccount,
-      tokenProgram: TOKEN_PROGRAM_ID,
-    });
-    if (signer) {
-      return builder.signers([signer]).rpc();
-    }
-    return builder.rpc();
-  }
-
-  async function withdraw(
-    userKp: Keypair,
-    userAta: PublicKey,
-    amount: anchor.BN
-  ) {
-    await program.methods
+  function withdraw(userKp: Keypair, userAta: PublicKey, amount: anchor.BN) {
+    return program.methods
       .withdraw(amount)
       .accountsPartial({
         user: userKp.publicKey,
@@ -133,8 +153,8 @@ describe("onboarding-pool", () => {
       .rpc();
   }
 
-  async function closePosition(userKp: Keypair) {
-    await program.methods
+  function closePosition(userKp: Keypair) {
+    return program.methods
       .closePosition()
       .accountsPartial({
         owner: userKp.publicKey,
@@ -145,54 +165,75 @@ describe("onboarding-pool", () => {
       .rpc();
   }
 
-  async function assertSolvent() {
+  function setPaused(paused: boolean) {
+    return program.methods
+      .setPaused(paused)
+      .accountsPartial({ authority: authority.publicKey, pool })
+      .rpc();
+  }
+
+  function setTreasury(newTreasury: PublicKey) {
+    return program.methods
+      .setTreasury(newTreasury)
+      .accountsPartial({ authority: authority.publicKey, mint, pool, newTreasury })
+      .rpc();
+  }
+
+  function skim(treasuryAccount: PublicKey, signer?: Keypair) {
+    const builder = program.methods.skimExcess().accountsPartial({
+      authority: signer ? signer.publicKey : authority.publicKey,
+      mint,
+      pool,
+      vault,
+      treasury: treasuryAccount,
+      tokenProgram: TOKEN_PROGRAM_ID,
+    });
+    return signer ? builder.signers([signer]).rpc() : builder.rpc();
+  }
+
+  // Checks the two invariants observable from a single account read:
+  //   1. Solvency:  vault.amount >= pool.total_principal
+  //   2. Principal conservation:  total_principal == sum of position principals
+  async function assertInvariants() {
     const vaultAccount = await getAccount(provider.connection, vault);
     const poolAccount = await program.account.pool.fetch(pool);
+
     assert.isTrue(
-      new anchor.BN(vaultAccount.amount.toString()).gte(
-        poolAccount.totalPrincipal
-      ),
-      "vault balance is below total principal"
+      new anchor.BN(vaultAccount.amount.toString()).gte(poolAccount.totalPrincipal),
+      "invariant 1 (solvency) violated"
+    );
+
+    // Position layout: discriminator(8) + owner(32) => pool field at offset 40.
+    const positions = await program.account.position.all([
+      { memcmp: { offset: 8 + 32, bytes: pool.toBase58() } },
+    ]);
+    const sum = positions.reduce(
+      (acc, p) => acc.add(p.account.principal),
+      new anchor.BN(0)
+    );
+    assert.strictEqual(
+      sum.toString(),
+      poolAccount.totalPrincipal.toString(),
+      "invariant 2 (principal conservation) violated"
     );
   }
 
   before(async () => {
-    mint = await createMint(
-      provider.connection,
-      (authority as anchor.Wallet).payer,
-      authority.publicKey,
-      null,
-      6
-    );
+    mint = await createMint(provider.connection, payer, authority.publicKey, null, 6);
+  });
 
-    const treasuryAccount = await getOrCreateAssociatedTokenAccount(
-      provider.connection,
-      (authority as anchor.Wallet).payer,
-      mint,
-      authority.publicKey
-    );
-    treasury = treasuryAccount.address;
-
+  beforeEach(async () => {
+    seed = nextSeed();
     pool = derivePool(seed);
     vault = await getAssociatedTokenAddress(mint, pool, true);
+    treasury = await freshTokenAccount(Keypair.generate().publicKey);
+    await initializePool(seed, pool, vault, treasury);
   });
 
   it("initializes the pool and creates the vault", async () => {
-    await program.methods
-      .initializePool(seed)
-      .accountsPartial({
-        authority: authority.publicKey,
-        mint,
-        treasury,
-        pool,
-        vault,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .rpc();
-
     const poolAccount = await program.account.pool.fetch(pool);
     assert.isTrue(poolAccount.authority.equals(authority.publicKey));
+    assert.isTrue(poolAccount.pendingAuthority.equals(PublicKey.default));
     assert.isTrue(poolAccount.treasury.equals(treasury));
     assert.isTrue(poolAccount.mint.equals(mint));
     assert.strictEqual(poolAccount.seed.toString(), seed.toString());
@@ -203,52 +244,38 @@ describe("onboarding-pool", () => {
     assert.strictEqual(vaultAccount.amount.toString(), "0");
     assert.isTrue(vaultAccount.mint.equals(mint));
 
-    await assertSolvent();
+    await assertInvariants();
   });
 
   it("rejects a treasury whose mint differs from the pool mint", async () => {
     const otherMint = await createMint(
       provider.connection,
-      (authority as anchor.Wallet).payer,
+      payer,
       authority.publicKey,
       null,
       6
     );
     const otherTreasury = await getOrCreateAssociatedTokenAccount(
       provider.connection,
-      (authority as anchor.Wallet).payer,
+      payer,
       otherMint,
       authority.publicKey
     );
 
-    const otherSeed = new anchor.BN(2);
-    const otherPool = derivePool(otherSeed);
-    const otherVault = await getAssociatedTokenAddress(mint, otherPool, true);
+    const badSeed = nextSeed();
+    const badPool = derivePool(badSeed);
+    const badVault = await getAssociatedTokenAddress(mint, badPool, true);
 
-    try {
-      await program.methods
-        .initializePool(otherSeed)
-        .accountsPartial({
-          authority: authority.publicKey,
-          mint,
-          treasury: otherTreasury.address,
-          pool: otherPool,
-          vault: otherVault,
-          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-          tokenProgram: TOKEN_PROGRAM_ID,
-        })
-        .rpc();
-      assert.fail("expected InvalidMint");
-    } catch (err) {
-      assert.include(err.toString(), "InvalidMint");
-    }
+    await expectError(
+      initializePool(badSeed, badPool, badVault, otherTreasury.address),
+      "InvalidMint"
+    );
   });
 
   it("creates a position with the correct owner on first deposit", async () => {
     const user = await createFundedUser(5_000_000n);
     const amount = new anchor.BN(1_000_000);
 
-    const before = await program.account.pool.fetch(pool);
     await deposit(user.kp, user.ata, amount);
 
     const position = await program.account.position.fetch(
@@ -258,13 +285,52 @@ describe("onboarding-pool", () => {
     assert.isTrue(position.pool.equals(pool));
     assert.strictEqual(position.principal.toString(), amount.toString());
 
-    const after = await program.account.pool.fetch(pool);
-    assert.strictEqual(
-      after.totalPrincipal.sub(before.totalPrincipal).toString(),
-      amount.toString()
-    );
+    const poolAccount = await program.account.pool.fetch(pool);
+    assert.strictEqual(poolAccount.totalPrincipal.toString(), amount.toString());
 
-    await assertSolvent();
+    await assertInvariants();
+  });
+
+  it("rejects a zero-amount deposit", async () => {
+    const user = await createFundedUser(5_000_000n);
+    await expectError(
+      deposit(user.kp, user.ata, new anchor.BN(0)),
+      "InvalidAmount"
+    );
+    await assertInvariants();
+  });
+
+  it("rejects a deposit larger than the user balance", async () => {
+    const user = await createFundedUser(1_000_000n);
+    // Program checks pass; the SPL token transfer fails on insufficient funds.
+    await expectReject(deposit(user.kp, user.ata, new anchor.BN(2_000_000)));
+    await assertInvariants();
+  });
+
+  it("rejects a deposit into a spoofed vault", async () => {
+    const user = await createFundedUser(5_000_000n);
+    // A real token account of the mint, but not the pool's associated vault.
+    const fakeVault = await freshTokenAccount(Keypair.generate().publicKey);
+
+    await expectReject(
+      program.methods
+        .deposit(new anchor.BN(1_000_000))
+        .accountsPartial({
+          user: user.kp.publicKey,
+          payer: authority.publicKey,
+          mint,
+          pool,
+          position: derivePosition(user.kp.publicKey),
+          userAta: user.ata,
+          vault: fakeVault,
+          associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
+          tokenProgram: TOKEN_PROGRAM_ID,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([user.kp])
+        .rpc()
+    );
+    await assertInvariants();
   });
 
   it("adds to principal on a second deposit without resetting owner", async () => {
@@ -279,12 +345,9 @@ describe("onboarding-pool", () => {
       derivePosition(user.kp.publicKey)
     );
     assert.isTrue(position.owner.equals(user.kp.publicKey));
-    assert.strictEqual(
-      position.principal.toString(),
-      first.add(second).toString()
-    );
+    assert.strictEqual(position.principal.toString(), first.add(second).toString());
 
-    await assertSolvent();
+    await assertInvariants();
   });
 
   it("tracks two users independently and sums total principal", async () => {
@@ -293,7 +356,6 @@ describe("onboarding-pool", () => {
     const amountA = new anchor.BN(1_500_000);
     const amountB = new anchor.BN(2_500_000);
 
-    const before = await program.account.pool.fetch(pool);
     await deposit(a.kp, a.ata, amountA);
     await deposit(b.kp, b.ata, amountB);
 
@@ -306,13 +368,13 @@ describe("onboarding-pool", () => {
     assert.strictEqual(positionA.principal.toString(), amountA.toString());
     assert.strictEqual(positionB.principal.toString(), amountB.toString());
 
-    const after = await program.account.pool.fetch(pool);
+    const poolAccount = await program.account.pool.fetch(pool);
     assert.strictEqual(
-      after.totalPrincipal.sub(before.totalPrincipal).toString(),
+      poolAccount.totalPrincipal.toString(),
       amountA.add(amountB).toString()
     );
 
-    await assertSolvent();
+    await assertInvariants();
   });
 
   it("does not let a third party overwrite an existing position owner", async () => {
@@ -320,8 +382,8 @@ describe("onboarding-pool", () => {
     const c = await createFundedUser(5_000_000n);
     await deposit(a.kp, a.ata, new anchor.BN(1_000_000));
 
-    try {
-      await program.methods
+    await expectError(
+      program.methods
         .deposit(new anchor.BN(1_000_000))
         .accountsPartial({
           user: c.kp.publicKey,
@@ -336,11 +398,9 @@ describe("onboarding-pool", () => {
           systemProgram: SystemProgram.programId,
         })
         .signers([c.kp])
-        .rpc();
-      assert.fail("expected a seeds constraint violation");
-    } catch (err) {
-      assert.include(err.toString(), "ConstraintSeeds");
-    }
+        .rpc(),
+      "ConstraintSeeds"
+    );
 
     const positionA = await program.account.position.fetch(
       derivePosition(a.kp.publicKey)
@@ -348,7 +408,7 @@ describe("onboarding-pool", () => {
     assert.isTrue(positionA.owner.equals(a.kp.publicKey));
   });
 
-  it("accrues points proportional to principal over elapsed time", async () => {
+  it("accrues points equal to principal times elapsed seconds", async () => {
     const user = await createFundedUser(5_000_000n);
     const principal = new anchor.BN(1_000_000);
 
@@ -357,29 +417,38 @@ describe("onboarding-pool", () => {
       derivePosition(user.kp.publicKey)
     );
 
-    await sleep(2000);
+    await sleep(1500);
+    // A second deposit accrues on the pre-existing principal before adding.
     await deposit(user.kp, user.ata, new anchor.BN(1));
 
     const end = await program.account.position.fetch(
       derivePosition(user.kp.publicKey)
     );
 
+    // Exact identity, not a tolerance: points == principal × elapsed.
     const elapsed = end.lastAccrual.sub(start.lastAccrual);
-    const expected = principal.mul(elapsed);
-    const diff = end.points.sub(expected).abs();
-    assert.isTrue(
-      diff.lte(principal),
-      `accrued ${end.points} expected ~${expected}`
-    );
+    const expected = start.principal.mul(elapsed);
+    assert.strictEqual(end.points.toString(), expected.toString());
+    assert.isTrue(elapsed.gtn(0), "elapsed should be non-zero");
 
-    await assertSolvent();
+    await assertInvariants();
+  });
+
+  it("rejects a zero-amount withdraw", async () => {
+    const user = await createFundedUser(5_000_000n);
+    await deposit(user.kp, user.ata, new anchor.BN(1_000_000));
+    await expectError(
+      withdraw(user.kp, user.ata, new anchor.BN(0)),
+      "InvalidAmount"
+    );
+    await assertInvariants();
   });
 
   it("reduces principal but preserves points on a partial withdraw", async () => {
     const user = await createFundedUser(5_000_000n);
     await deposit(user.kp, user.ata, new anchor.BN(3_000_000));
 
-    await sleep(1500);
+    await sleep(1200);
     await withdraw(user.kp, user.ata, new anchor.BN(1_000_000));
 
     const position = await program.account.position.fetch(
@@ -389,7 +458,7 @@ describe("onboarding-pool", () => {
     // Points are monotonic (invariant 4): a withdraw never resets them.
     assert.isTrue(position.points.gt(new anchor.BN(0)));
 
-    await assertSolvent();
+    await assertInvariants();
   });
 
   it("withdraws the full amount and leaves the position open", async () => {
@@ -404,22 +473,29 @@ describe("onboarding-pool", () => {
     assert.strictEqual(position.principal.toString(), "0");
     assert.isTrue(position.owner.equals(user.kp.publicKey));
 
-    await assertSolvent();
+    await assertInvariants();
+  });
+
+  it("rejects a withdraw exceeding principal", async () => {
+    const user = await createFundedUser(5_000_000n);
+    await deposit(user.kp, user.ata, new anchor.BN(1_000_000));
+
+    await expectError(
+      withdraw(user.kp, user.ata, new anchor.BN(1_500_000)),
+      "InsufficientPrincipal"
+    );
+
+    await assertInvariants();
   });
 
   it("rejects closing a position that still holds principal", async () => {
     const user = await createFundedUser(5_000_000n);
     await deposit(user.kp, user.ata, new anchor.BN(1_000_000));
 
-    try {
-      await closePosition(user.kp);
-      assert.fail("expected PositionNotEmpty");
-    } catch (err) {
-      assert.include(err.toString(), "PositionNotEmpty");
-    }
+    await expectError(closePosition(user.kp), "PositionNotEmpty");
 
     await withdraw(user.kp, user.ata, new anchor.BN(1_000_000));
-    await assertSolvent();
+    await assertInvariants();
   });
 
   it("closes an empty position and lets the owner redeposit fresh", async () => {
@@ -443,7 +519,7 @@ describe("onboarding-pool", () => {
     assert.strictEqual(reopened.points.toString(), "0");
 
     await withdraw(user.kp, user.ata, new anchor.BN(1_000_000));
-    await assertSolvent();
+    await assertInvariants();
   });
 
   it("deposits and withdraws through a non-ATA user token account", async () => {
@@ -451,19 +527,12 @@ describe("onboarding-pool", () => {
     // A plain token account owned by the user, not the associated token account.
     const nonAta = await createAccount(
       provider.connection,
-      (authority as anchor.Wallet).payer,
+      payer,
       mint,
       userKp.publicKey,
       Keypair.generate()
     );
-    await mintTo(
-      provider.connection,
-      (authority as anchor.Wallet).payer,
-      mint,
-      nonAta,
-      authority.publicKey,
-      2_000_000n
-    );
+    await mintTo(provider.connection, payer, mint, nonAta, authority.publicKey, 2_000_000n);
 
     await deposit(userKp, nonAta, new anchor.BN(1_500_000));
     const position = await program.account.position.fetch(
@@ -475,44 +544,20 @@ describe("onboarding-pool", () => {
     const account = await getAccount(provider.connection, nonAta);
     assert.strictEqual(account.amount.toString(), "2000000");
 
-    await assertSolvent();
-  });
-
-  it("rejects a withdraw exceeding principal", async () => {
-    const user = await createFundedUser(5_000_000n);
-    await deposit(user.kp, user.ata, new anchor.BN(1_000_000));
-
-    try {
-      await withdraw(user.kp, user.ata, new anchor.BN(1_500_000));
-      assert.fail("expected InsufficientPrincipal");
-    } catch (err) {
-      assert.include(err.toString(), "InsufficientPrincipal");
-    }
-
-    await assertSolvent();
+    await assertInvariants();
   });
 
   it("rejects a skim when there is no excess", async () => {
-    try {
-      await skim(treasury);
-      assert.fail("expected NothingToSkim");
-    } catch (err) {
-      assert.include(err.toString(), "NothingToSkim");
-    }
-
-    await assertSolvent();
+    await expectError(skim(treasury), "NothingToSkim");
+    await assertInvariants();
   });
 
   it("skims the full excess and leaves principal untouched", async () => {
+    const user = await createFundedUser(5_000_000n);
+    await deposit(user.kp, user.ata, new anchor.BN(1_000_000));
+
     const injected = 10_000n;
-    await mintTo(
-      provider.connection,
-      (authority as anchor.Wallet).payer,
-      mint,
-      vault,
-      authority.publicKey,
-      injected
-    );
+    await mintTo(provider.connection, payer, mint, vault, authority.publicKey, injected);
 
     const poolBefore = await program.account.pool.fetch(pool);
     const treasuryBefore = await getAccount(provider.connection, treasury);
@@ -523,47 +568,31 @@ describe("onboarding-pool", () => {
     const treasuryAfter = await getAccount(provider.connection, treasury);
 
     // The whole surplus is skimmed; there is no retained margin.
-    const expectedSkimmed = injected;
     assert.strictEqual(
       (treasuryAfter.amount - treasuryBefore.amount).toString(),
-      expectedSkimmed.toString()
+      injected.toString()
     );
     assert.strictEqual(
       poolAfter.totalPrincipal.toString(),
       poolBefore.totalPrincipal.toString()
     );
 
-    await assertSolvent();
+    await assertInvariants();
   });
 
   it("rejects a skim from a non authority", async () => {
-    const intruder = Keypair.generate();
-    try {
-      await skim(treasury, intruder);
-      assert.fail("expected a has_one violation");
-    } catch (err) {
-      assert.include(err.toString(), "ConstraintHasOne");
-    }
-
-    await assertSolvent();
+    await expectError(skim(treasury, Keypair.generate()), "ConstraintHasOne");
+    await assertInvariants();
   });
 
   it("rejects a skim to a treasury other than the pool treasury", async () => {
-    const wrong = await getOrCreateAssociatedTokenAccount(
-      provider.connection,
-      (authority as anchor.Wallet).payer,
-      mint,
-      Keypair.generate().publicKey
-    );
-
-    try {
-      await skim(wrong.address);
-      assert.fail("expected InvalidTreasury");
-    } catch (err) {
-      assert.include(err.toString(), "InvalidTreasury");
-    }
-
-    await assertSolvent();
+    const wrong = await freshTokenAccount(Keypair.generate().publicKey);
+    // Give it a surplus so the treasury check is what actually fails.
+    await mintTo(provider.connection, payer, mint, vault, authority.publicKey, 5_000n);
+    await expectError(skim(wrong), "InvalidTreasury");
+    // Clean the injected surplus back out so invariants hold for the next test.
+    await skim(treasury);
+    await assertInvariants();
   });
 
   it("blocks deposit and skim while paused but never withdraw", async () => {
@@ -572,19 +601,8 @@ describe("onboarding-pool", () => {
 
     await setPaused(true);
 
-    try {
-      await deposit(user.kp, user.ata, new anchor.BN(1_000_000));
-      assert.fail("expected Paused on deposit");
-    } catch (err) {
-      assert.include(err.toString(), "Paused");
-    }
-
-    try {
-      await skim(treasury);
-      assert.fail("expected Paused on skim");
-    } catch (err) {
-      assert.include(err.toString(), "Paused");
-    }
+    await expectError(deposit(user.kp, user.ata, new anchor.BN(1_000_000)), "Paused");
+    await expectError(skim(treasury), "Paused");
 
     // Invariant 3: withdrawal liveness holds even while paused.
     await withdraw(user.kp, user.ata, new anchor.BN(2_000_000));
@@ -593,21 +611,15 @@ describe("onboarding-pool", () => {
     );
     assert.strictEqual(position.principal.toString(), "0");
 
-    await setPaused(false);
-    await assertSolvent();
+    await assertInvariants();
   });
 
   it("updates the treasury to another account of the same mint", async () => {
-    const fresh = await getOrCreateAssociatedTokenAccount(
-      provider.connection,
-      (authority as anchor.Wallet).payer,
-      mint,
-      Keypair.generate().publicKey
-    );
+    const fresh = await freshTokenAccount(Keypair.generate().publicKey);
 
-    await setTreasury(fresh.address);
+    await setTreasury(fresh);
     let poolAccount = await program.account.pool.fetch(pool);
-    assert.isTrue(poolAccount.treasury.equals(fresh.address));
+    assert.isTrue(poolAccount.treasury.equals(fresh));
 
     await setTreasury(treasury);
     poolAccount = await program.account.pool.fetch(pool);
@@ -617,118 +629,88 @@ describe("onboarding-pool", () => {
   it("rejects a treasury update whose mint differs from the pool mint", async () => {
     const otherMint = await createMint(
       provider.connection,
-      (authority as anchor.Wallet).payer,
+      payer,
       authority.publicKey,
       null,
       6
     );
     const otherAta = await getOrCreateAssociatedTokenAccount(
       provider.connection,
-      (authority as anchor.Wallet).payer,
+      payer,
       otherMint,
       authority.publicKey
     );
 
-    try {
-      await setTreasury(otherAta.address);
-      assert.fail("expected a token mint constraint violation");
-    } catch (err) {
-      assert.include(err.toString(), "ConstraintTokenMint");
-    }
+    await expectError(setTreasury(otherAta.address), "ConstraintTokenMint");
   });
 
   it("rotates authority via two-step propose and accept", async () => {
-    // Isolated pool so rotating authority does not disturb the shared suite.
-    const rSeed = new anchor.BN(3);
-    const rPool = derivePool(rSeed);
-    const rVault = await getAssociatedTokenAddress(mint, rPool, true);
-    await program.methods
-      .initializePool(rSeed)
-      .accountsPartial({
-        authority: authority.publicKey,
-        mint,
-        treasury,
-        pool: rPool,
-        vault: rVault,
-        associatedTokenProgram: ASSOCIATED_TOKEN_PROGRAM_ID,
-        tokenProgram: TOKEN_PROGRAM_ID,
-      })
-      .rpc();
-
     const next = Keypair.generate();
-
-    // a non-authority cannot propose
     const intruder = Keypair.generate();
-    try {
-      await program.methods
+
+    // A non-authority cannot propose.
+    await expectError(
+      program.methods
         .proposeAuthority(next.publicKey)
-        .accountsPartial({ authority: intruder.publicKey, pool: rPool })
+        .accountsPartial({ authority: intruder.publicKey, pool })
         .signers([intruder])
-        .rpc();
-      assert.fail("expected ConstraintHasOne on propose");
-    } catch (err) {
-      assert.include(err.toString(), "ConstraintHasOne");
-    }
+        .rpc(),
+      "ConstraintHasOne"
+    );
 
-    // accept with no pending proposal is rejected
-    try {
-      await program.methods
+    // Accept with no pending proposal is rejected.
+    await expectError(
+      program.methods
         .acceptAuthority()
-        .accountsPartial({ newAuthority: next.publicKey, pool: rPool })
+        .accountsPartial({ newAuthority: next.publicKey, pool })
         .signers([next])
-        .rpc();
-      assert.fail("expected NoPendingAuthority");
-    } catch (err) {
-      assert.include(err.toString(), "NoPendingAuthority");
-    }
+        .rpc(),
+      "NoPendingAuthority"
+    );
 
-    // current authority proposes the next one
+    // Current authority proposes the next one.
     await program.methods
       .proposeAuthority(next.publicKey)
-      .accountsPartial({ authority: authority.publicKey, pool: rPool })
+      .accountsPartial({ authority: authority.publicKey, pool })
       .rpc();
 
-    // accept by the wrong key is rejected
+    // Accept by the wrong key is rejected.
     const wrong = Keypair.generate();
-    try {
-      await program.methods
+    await expectError(
+      program.methods
         .acceptAuthority()
-        .accountsPartial({ newAuthority: wrong.publicKey, pool: rPool })
+        .accountsPartial({ newAuthority: wrong.publicKey, pool })
         .signers([wrong])
-        .rpc();
-      assert.fail("expected NotPendingAuthority");
-    } catch (err) {
-      assert.include(err.toString(), "NotPendingAuthority");
-    }
+        .rpc(),
+      "NotPendingAuthority"
+    );
 
-    // the pending authority accepts
+    // The pending authority accepts.
     await program.methods
       .acceptAuthority()
-      .accountsPartial({ newAuthority: next.publicKey, pool: rPool })
+      .accountsPartial({ newAuthority: next.publicKey, pool })
       .signers([next])
       .rpc();
 
-    let p = await program.account.pool.fetch(rPool);
+    let p = await program.account.pool.fetch(pool);
     assert.isTrue(p.authority.equals(next.publicKey));
     assert.isTrue(p.pendingAuthority.equals(PublicKey.default));
 
-    // authority-gated instructions now follow the new authority and reject the old
-    try {
-      await program.methods
+    // Authority-gated instructions follow the new authority and reject the old.
+    await expectError(
+      program.methods
         .setPaused(true)
-        .accountsPartial({ authority: authority.publicKey, pool: rPool })
-        .rpc();
-      assert.fail("expected ConstraintHasOne for the old authority");
-    } catch (err) {
-      assert.include(err.toString(), "ConstraintHasOne");
-    }
+        .accountsPartial({ authority: authority.publicKey, pool })
+        .rpc(),
+      "ConstraintHasOne"
+    );
 
     await program.methods
       .setPaused(true)
-      .accountsPartial({ authority: next.publicKey, pool: rPool })
+      .accountsPartial({ authority: next.publicKey, pool })
       .signers([next])
       .rpc();
-    p = await program.account.pool.fetch(rPool);
+    p = await program.account.pool.fetch(pool);
     assert.strictEqual(p.paused, true);
   });
 });
