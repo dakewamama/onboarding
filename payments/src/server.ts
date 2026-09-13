@@ -13,6 +13,16 @@ import { handleWebhook } from "./webhookHandler";
 import { Settlement } from "./types";
 import { mountFunding } from "./funding/http";
 
+// Keep the receiver alive through background faults. The funding watcher polls an
+// external RPC that can rate-limit or blip; a stray rejection there must never
+// take down the webhook receiver (which handles money). Log loudly, stay up.
+process.on("unhandledRejection", (reason) => {
+  console.error("[fatal] unhandledRejection (kept alive):", reason);
+});
+process.on("uncaughtException", (err) => {
+  console.error("[fatal] uncaughtException (kept alive):", err);
+});
+
 const cfg = loadConfig();
 if (!cfg.webhookSecret) {
   console.warn(
