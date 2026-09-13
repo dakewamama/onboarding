@@ -27,6 +27,12 @@ export class UsdcWatcher {
   private timer: NodeJS.Timeout | null = null;
   private polling = false;
   private watchDir: string;
+  // Rate-limit backoff: when the RPC 429s, pause polling and grow the pause
+  // (capped), so a throttled RPC never turns into a request/log storm.
+  private cooldownUntil = 0;
+  private backoffMs = 0;
+  private static readonly BASE_BACKOFF_MS = 30_000;
+  private static readonly MAX_BACKOFF_MS = 300_000;
 
   constructor(
     private cfg: FundingConfig,
@@ -35,7 +41,13 @@ export class UsdcWatcher {
     connection?: Connection
   ) {
     this.connection =
-      connection ?? new Connection(cfg.rpcUrl, cfg.commitment);
+      connection ??
+      // disableRetryOnRateLimit: web3.js otherwise retries every 429 five times,
+      // which multiplies load on an already-throttled RPC. We do our own backoff.
+      new Connection(cfg.rpcUrl, {
+        commitment: cfg.commitment,
+        disableRetryOnRateLimit: true,
+      });
     this.mint = new PublicKey(cfg.usdcMint);
     this.watchDir = path.join(cfg.storeDir, "watch");
     fs.mkdirSync(this.watchDir, { recursive: true });
@@ -128,20 +140,40 @@ export class UsdcWatcher {
     }
   }
 
-  /** One full poll across every watched owner. Single-flight. */
+  /** One full poll across every watched owner. Single-flight, with RPC backoff. */
   async pollOnce(): Promise<void> {
     if (this.polling) return;
+    if (Date.now() < this.cooldownUntil) return; // in backoff, skip this tick
     this.polling = true;
+    let rateLimited = false;
     try {
       for (const owner of this.watchedOwners()) {
         try {
           await this.scanOwner(owner);
         } catch (err) {
-          console.error(`[funding] scan failed for ${owner}:`, (err as Error).message);
+          const msg = (err as Error).message;
+          if (isRateLimit(msg)) {
+            rateLimited = true;
+            break; // stop hitting a throttled RPC; back off below
+          }
+          console.error(`[funding] scan failed for ${owner}:`, msg);
         }
       }
     } finally {
       this.polling = false;
+      if (rateLimited) {
+        this.backoffMs = this.backoffMs
+          ? Math.min(this.backoffMs * 2, UsdcWatcher.MAX_BACKOFF_MS)
+          : UsdcWatcher.BASE_BACKOFF_MS;
+        this.cooldownUntil = Date.now() + this.backoffMs;
+        console.warn(
+          `[funding] RPC rate-limited; pausing deposit scans for ${Math.round(
+            this.backoffMs / 1000
+          )}s (consider a dedicated SOLANA_RPC_URL)`
+        );
+      } else {
+        this.backoffMs = 0; // clean poll, reset backoff
+      }
     }
   }
 
@@ -162,4 +194,8 @@ export class UsdcWatcher {
 
 function safe(s: string): string {
   return s.replace(/[^a-zA-Z0-9_-]/g, "_");
+}
+
+function isRateLimit(message: string): boolean {
+  return /429|too many requests|rate limit/i.test(message);
 }
