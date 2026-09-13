@@ -50,10 +50,12 @@ export function loadFundingConfig(
     rpcUrl,
     usdcMint: env.SOLANA_USDC_MINT ?? MAINNET_USDC,
     commitment,
+    // Defaults tuned to live comfortably within Solana's free public RPC limits:
+    // poll infrequently and pull a small page. Override via env for a paid RPC.
     pollIntervalMs: env.FUNDING_POLL_INTERVAL_MS
       ? Number(env.FUNDING_POLL_INTERVAL_MS)
-      : 15000,
-    pageSize: env.FUNDING_PAGE_SIZE ? Number(env.FUNDING_PAGE_SIZE) : 25,
+      : 60000,
+    pageSize: env.FUNDING_PAGE_SIZE ? Number(env.FUNDING_PAGE_SIZE) : 10,
     storeDir:
       env.FUNDING_STORE_DIR ??
       path.resolve(__dirname, "..", "..", ".funding-store"),
