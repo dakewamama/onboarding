@@ -12,6 +12,7 @@ import { PajProvider } from "./pajProvider";
 import { handleWebhook } from "./webhookHandler";
 import { Settlement } from "./types";
 import { mountFunding } from "./funding/http";
+import { mountOfframp } from "./offramp";
 
 // Keep the receiver alive through background faults. The funding watcher polls an
 // external RPC that can rate-limit or blip; a stray rejection there must never
@@ -44,6 +45,9 @@ async function credit(s: Settlement): Promise<void> {
 // (SOLANA_RPC_URL set); the Paj receiver runs unchanged either way. Returns a
 // handler that claims /funding/* requests and reports whether it handled one.
 const funding = mountFunding();
+// Authenticated off-ramp initiation for the brain (needs PAJ_API_KEY +
+// INTERNAL_API_TOKEN). Fail-closed otherwise.
+const offramp = mountOfframp(cfg);
 
 async function handlePajWebhook(req: http.IncomingMessage, res: http.ServerResponse) {
   const chunks: Buffer[] = [];
@@ -66,6 +70,7 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/webhooks/paj") {
     return handlePajWebhook(req, res);
   }
+  if (await offramp.handle(req, res)) return; // /offramp* claimed it
   if (await funding.handle(req, res)) return; // /funding/* claimed it
   res.writeHead(404).end();
 });
@@ -75,4 +80,5 @@ server.listen(PORT, () => {
     `Paj webhook receiver on http://localhost:${PORT}/webhooks/paj (env=${cfg.env}, mode=${cfg.mode})`
   );
   funding.logStatus(PORT);
+  offramp.logStatus(PORT);
 });
