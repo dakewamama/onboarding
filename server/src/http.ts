@@ -1,7 +1,8 @@
 /**
  * Minimal HTTP wrapper around the custody service (devnet prototype). Uses the
- * built-in http module to avoid extra deps; in production this would be a proper
- * framework behind auth, TLS, rate limiting, and per-route authorization.
+ * built-in http module to avoid extra deps. Every route requires a bearer token
+ * (CUSTODY_API_TOKEN) and fails closed when it is unset. TLS and rate limiting
+ * are still expected to be provided by the deployment layer in production.
  *
  *   ANCHOR_PROVIDER_URL=https://api.devnet.solana.com yarn run custody-server
  *
@@ -16,9 +17,11 @@ import * as http from "http";
 import { PublicKey } from "@solana/web3.js";
 import { connection, loadOperatorKeypair } from "./config";
 import { CustodyService } from "./service";
+import { bearerOk } from "./httpAuth";
 
 const svc = new CustodyService(connection(), loadOperatorKeypair());
 const PORT = Number(process.env.PORT ?? 8787);
+const CUSTODY_API_TOKEN = process.env.CUSTODY_API_TOKEN;
 
 function send(res: http.ServerResponse, code: number, body: unknown) {
   res.writeHead(code, { "content-type": "application/json" });
@@ -42,6 +45,12 @@ function readBody(req: http.IncomingMessage): Promise<any> {
 
 const server = http.createServer(async (req, res) => {
   try {
+    // Every route is privileged (create user, grant scope, sign transfers), so
+    // authenticate before doing anything. Fails closed when no token is set.
+    if (!bearerOk(req.headers["authorization"], CUSTODY_API_TOKEN)) {
+      return send(res, 401, { error: "unauthorized" });
+    }
+
     const url = new URL(req.url ?? "/", `http://localhost:${PORT}`);
     const parts = url.pathname.split("/").filter(Boolean);
     const method = req.method ?? "GET";
