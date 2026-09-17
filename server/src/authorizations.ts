@@ -16,7 +16,10 @@ export type Action = "deposit" | "withdraw";
 export interface Authorization {
   userId: string;
   scope: Action[];
-  maxAmountPerTx: number; // 0 = unlimited (prototype convenience)
+  // Per-tx cap in base units. Zero means ZERO: no transfer is permitted until a
+  // positive cap is set explicitly. (Previously 0 meant "unlimited", which turned
+  // the safest-looking value into the most permissive behaviour.)
+  maxAmountPerTx: number;
   grantedAt: string;
 }
 
@@ -42,6 +45,30 @@ export function grant(
   return auth;
 }
 
+/**
+ * Pure authorization check (no I/O), so it is unit-testable. Fails closed: an
+ * unscoped action, a non-positive amount, or an amount over the per-tx cap all
+ * throw. With maxAmountPerTx = 0, every positive amount is over the cap — zero
+ * means zero.
+ */
+export function checkAuthorization(
+  auth: Authorization,
+  action: Action,
+  amount: number
+): void {
+  if (!auth.scope.includes(action)) {
+    throw new Error(`user ${auth.userId} has not authorized "${action}"`);
+  }
+  if (!(amount > 0)) {
+    throw new Error(`amount must be a positive number, got ${amount}`);
+  }
+  if (amount > auth.maxAmountPerTx) {
+    throw new Error(
+      `amount ${amount} exceeds authorized per-tx max ${auth.maxAmountPerTx}`
+    );
+  }
+}
+
 export function assertAuthorized(
   userId: string,
   action: Action,
@@ -52,12 +79,5 @@ export function assertAuthorized(
     throw new Error(`no authorization on file for ${userId}`);
   }
   const auth: Authorization = JSON.parse(fs.readFileSync(file, "utf8"));
-  if (!auth.scope.includes(action)) {
-    throw new Error(`user ${userId} has not authorized "${action}"`);
-  }
-  if (auth.maxAmountPerTx > 0 && amount > auth.maxAmountPerTx) {
-    throw new Error(
-      `amount ${amount} exceeds authorized per-tx max ${auth.maxAmountPerTx}`
-    );
-  }
+  checkAuthorization(auth, action, amount);
 }
