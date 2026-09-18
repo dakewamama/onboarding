@@ -44,6 +44,19 @@ export interface PajOrderResponse {
   [k: string]: unknown;
 }
 
+/**
+ * A registered bank account and its PERMANENT deterministic on-chain address.
+ * This is the correct v2 primitive (docs.paj.cash/concepts/bank-account-addresses):
+ * register once, cache the address, then send USDC to it to pay out fiat.
+ */
+export interface PajBankAccount {
+  id: string;
+  accountName: string; // bank-verified; show to the user to confirm before paying
+  accountNumber: string;
+  bank: string;
+  address: string;
+}
+
 export class PajClient {
   constructor(private cfg: Pick<PajConfig, "apiKey" | "env">) {}
 
@@ -77,6 +90,25 @@ export class PajClient {
     return (text ? JSON.parse(text) : undefined) as T;
   }
 
+  /**
+   * Register (idempotent) a bank account and get its PERMANENT deterministic
+   * on-chain address. THE correct off-ramp primitive: register once, cache the
+   * address + accountName, confirm the name with the user, then send USDC to the
+   * address to pay out. Re-calling with the same details returns the same record.
+   */
+  registerBankAccount(body: {
+    bankCode: string;
+    accountNumber: string;
+  }): Promise<PajBankAccount> {
+    return this.request("POST", "/pub/v2/bank-account", body);
+  }
+
+  /**
+   * @deprecated Per-order off-ramp with an expiring address — the shape where
+   * funding is hardest. Use `registerBankAccount` + send USDC to the permanent
+   * address instead. Kept only until the register-once payout path is wired end
+   * to end (needs the custody signer). Do not build new callers on this.
+   */
   createOfframp(body: OfframpBody): Promise<PajOrderResponse> {
     return this.request("POST", "/pub/v2/offramp", body);
   }

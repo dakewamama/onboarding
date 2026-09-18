@@ -56,6 +56,18 @@ export function mountOfframp(cfg: PajConfig): OfframpMount {
         const result = await client!.resolveBankAccount({ accountNumber });
         return void send(res, 200, result), true;
       }
+      if (url.pathname === "/offramp/register") {
+        // The correct v2 primitive: register (idempotent) and return the
+        // PERMANENT deterministic address + bank-verified accountName. The caller
+        // confirms the name with the user, caches the address, then funds it.
+        const bankCode = String(body.bankCode ?? "");
+        const accountNumber = String(body.accountNumber ?? "");
+        if (!bankCode || !accountNumber) {
+          return void send(res, 400, { error: "bankCode and accountNumber required" }), true;
+        }
+        const account = await client!.registerBankAccount({ bankCode, accountNumber });
+        return void send(res, 200, account), true;
+      }
       if (url.pathname === "/offramp") {
         const bankCode = String(body.bankCode ?? "");
         const accountNumber = String(body.accountNumber ?? "");
@@ -91,7 +103,7 @@ export function mountOfframp(cfg: PajConfig): OfframpMount {
   function logStatus(_port: number): void {
     console.log(
       enabled
-        ? "[offramp] authenticated off-ramp routes enabled (/offramp, /offramp/resolve-account)"
+        ? "[offramp] authenticated off-ramp routes enabled (/offramp/register, /offramp, /offramp/resolve-account)"
         : `[offramp] disabled (${disabledReason})`,
     );
   }
