@@ -72,6 +72,19 @@ export class SpendLedger {
     return fs.existsSync(this.spendPath(owner, idempotencyKey));
   }
 
+  /**
+   * Release a reservation — used when delivery fails AFTER the debit was recorded,
+   * so the funds return to available. Returns true if a record was removed. A real
+   * DB deployment writes a compensating entry inside the same transaction instead
+   * of deleting; deletion is the file-store equivalent and keeps balance derived.
+   */
+  void(owner: string, idempotencyKey: string): boolean {
+    const p = this.spendPath(owner, idempotencyKey);
+    if (!fs.existsSync(p)) return false;
+    fs.unlinkSync(p);
+    return true;
+  }
+
   private read(owner: string, key: string): SpendRecord | null {
     try {
       return JSON.parse(
