@@ -13,8 +13,8 @@ import type { SpendResult } from "./funding/spendLedger";
 import { ngnToUsdcBase } from "./rate";
 
 export interface AirtimeFulfillDeps {
-  /** NGN per 1 USDC. */
-  ngnPerUsdc: number;
+  /** Resolve NGN per 1 USDC at buy time (Paj live rate, env fallback). */
+  getRate: () => Promise<number>;
   /** Axis markup over VTpass cost, in basis points (0 = charge cost only). */
   marginBps: number;
   availableBaseUnits: (owner: string) => bigint;
@@ -55,9 +55,10 @@ export async function fulfillAirtime(
   deps: AirtimeFulfillDeps,
   params: AirtimeFulfillParams,
 ): Promise<AirtimeFulfillResult> {
-  const costBase = ngnToUsdcBase(params.amount, deps.ngnPerUsdc);
+  const ngnPerUsdc = await deps.getRate();
+  const costBase = ngnToUsdcBase(params.amount, ngnPerUsdc);
   const paidNgn = params.amount * (1 + deps.marginBps / 10000);
-  const paidBase = ngnToUsdcBase(paidNgn, deps.ngnPerUsdc);
+  const paidBase = ngnToUsdcBase(paidNgn, ngnPerUsdc);
 
   // 1) Reserve funds first (idempotent, balance-checked). Throws
   //    InsufficientBalanceError if the owner can't cover it.

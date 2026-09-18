@@ -5,10 +5,12 @@ import { VtpassClient, VtpassEnv } from "./vtpassClient";
 import { DepositLedger } from "./funding/depositLedger";
 import { SpendLedger, InsufficientBalanceError } from "./funding/spendLedger";
 import { fundingStoreDir } from "./funding/config";
-import { usdcToNgnRate } from "./rate";
+import { usdcToNgnRate, offRampNgnPerUsdc } from "./rate";
 import { fulfillAirtime, AirtimeFulfillDeps } from "./airtimeFulfill";
 import { IdentityStore } from "./identity";
 import { provisionWallet } from "./custody";
+import { PajClient } from "./pajClient";
+import type { Currency } from "./types";
 
 /**
  * Authenticated airtime fulfilment, mounted next to the off-ramp + webhook
@@ -36,20 +38,40 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
     apiKey && secretKey
       ? new VtpassClient({ apiKey, secretKey, publicKey, env: vtEnv })
       : null;
-  let ngnPerUsdc: number | null;
+  // Rate: prefer Paj's live off-ramp rate (settlement-consistent, fee included);
+  // fall back to a static env rate if Paj isn't configured/reachable.
+  const pajApiKey = env.PAJ_API_KEY;
+  const pajEnv = env.PAJ_ENV === "production" ? "production" : "staging";
+  const pajClient = pajApiKey ? new PajClient({ apiKey: pajApiKey, env: pajEnv }) : null;
+  let staticRate: number | null;
   try {
-    ngnPerUsdc = usdcToNgnRate(env);
+    staticRate = usdcToNgnRate(env);
   } catch {
-    ngnPerUsdc = null;
+    staticRate = null;
   }
+  const rateAvailable = Boolean(pajClient || staticRate);
+
+  async function getRate(): Promise<number> {
+    if (pajClient) {
+      try {
+        const v = offRampNgnPerUsdc(await pajClient.getRate("NGN" as Currency));
+        if (v) return v;
+      } catch {
+        // fall through to the static fallback
+      }
+    }
+    if (staticRate) return staticRate;
+    throw new Error("no rate available (set PAJ_API_KEY or AXIS_USDC_NGN_RATE)");
+  }
+
   const marginBps = Number(env.AXIS_AIRTIME_MARGIN_BPS ?? 0) || 0;
-  const enabled = Boolean(token && client && ngnPerUsdc);
+  const enabled = Boolean(token && client && rateAvailable);
   const disabledReason = !token
     ? "INTERNAL_API_TOKEN not set"
     : !client
       ? "VTPASS_API_KEY/VTPASS_SECRET_KEY not set"
-      : !ngnPerUsdc
-        ? "AXIS_USDC_NGN_RATE not set"
+      : !rateAvailable
+        ? "no rate (set PAJ_API_KEY or AXIS_USDC_NGN_RATE)"
         : "";
 
   const storeDir = fundingStoreDir(env);
@@ -57,7 +79,7 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
   const spends = new SpendLedger(storeDir);
   const identity = new IdentityStore(storeDir);
   const deps: AirtimeFulfillDeps = {
-    ngnPerUsdc: ngnPerUsdc ?? 0,
+    getRate,
     marginBps,
     availableBaseUnits: (owner) =>
       deposits.balanceBaseUnits(owner) - spends.spentBaseUnits(owner),

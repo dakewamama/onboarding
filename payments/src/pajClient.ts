@@ -1,5 +1,6 @@
 import { BASE_URLS, PajConfig } from "./config";
 import { Chain, Currency } from "./types";
+import type { PajRateResponse } from "./rate";
 
 /**
  * Thin HTTP client over the Paj v2 REST API. Auth is API-key-only via the
@@ -141,7 +142,7 @@ export class PajClient {
     return this.request("GET", "/pub/v2/bank", undefined, filters);
   }
 
-  getRate(currency: Currency): Promise<unknown> {
+  getRate(currency: Currency): Promise<PajRateResponse> {
     return this.request("GET", "/pub/v2/rate", undefined, { currency });
   }
 

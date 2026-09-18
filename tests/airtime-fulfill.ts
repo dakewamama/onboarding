@@ -3,7 +3,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import { fulfillAirtime, AirtimeFulfillDeps } from "../payments/src/airtimeFulfill";
-import { usdcToNgnRate, ngnToUsdcBase } from "../payments/src/rate";
+import { usdcToNgnRate, ngnToUsdcBase, offRampNgnPerUsdc } from "../payments/src/rate";
 import { SpendLedger, InsufficientBalanceError } from "../payments/src/funding/spendLedger";
 import type { AirtimeResult } from "../payments/src/vtpassClient";
 
@@ -21,7 +21,7 @@ function deps(
   buyAirtime: () => Promise<AirtimeResult>,
 ): AirtimeFulfillDeps {
   return {
-    ngnPerUsdc: RATE,
+    getRate: async () => RATE,
     marginBps: 0,
     availableBaseUnits: () => available - spends.spentBaseUnits("w"),
     spend: (input, avail) => spends.spend(input, avail),
@@ -38,6 +38,12 @@ describe("rate", () => {
   it("ngnToUsdcBase rounds up to 6dp", () => {
     // 100 NGN / 1500 = 0.066666... USDC -> ceil to 0.066667 -> 66667 base units
     assert.equal(ngnToUsdcBase(100, 1500).toString(), "66667");
+  });
+  it("offRampNgnPerUsdc pulls the Paj off-ramp rate", () => {
+    assert.equal(offRampNgnPerUsdc({ offRampRate: { rate: 1650 } }), 1650);
+    assert.isNull(offRampNgnPerUsdc({ onRampRate: { rate: 1650 } })); // wrong field
+    assert.isNull(offRampNgnPerUsdc({}));
+    assert.isNull(offRampNgnPerUsdc(null));
   });
 });
 

@@ -1,11 +1,24 @@
 /**
- * NGN <-> USDC conversion for pricing. The rate is OPERATOR-CONFIGURED
- * (AXIS_USDC_NGN_RATE = NGN per 1 USDC) — real, deterministic data, never a
- * model-originated number. Fail-closed: unset/invalid throws at point of use, so
- * a purchase can't be priced against a missing rate. (Swap for a live feed later;
- * the caller contract stays identical.)
+ * NGN <-> USDC conversion for pricing. Real, deterministic data — never a
+ * model-originated number. Preferred source is Paj's live off-ramp rate (our
+ * settlement partner, so pricing stays consistent with what we actually get on
+ * off-ramp; the rate already includes our business fee). AXIS_USDC_NGN_RATE is
+ * only a fallback when Paj can't be reached.
  */
 
+/** Shape of GET /pub/v2/rate — offRampRate.rate is NGN per USDC (crypto->fiat). */
+export interface PajRateResponse {
+  offRampRate?: { rate?: number };
+  onRampRate?: { rate?: number };
+}
+
+/** Extract the USDC->NGN (off-ramp) rate, or null if absent/invalid. */
+export function offRampNgnPerUsdc(r: PajRateResponse | null | undefined): number | null {
+  const v = r?.offRampRate?.rate;
+  return typeof v === "number" && v > 0 ? v : null;
+}
+
+/** Static fallback rate from env; throws when unset/invalid. */
 export function usdcToNgnRate(env: NodeJS.ProcessEnv = process.env): number {
   const raw = env.AXIS_USDC_NGN_RATE;
   const n = raw ? Number(raw) : NaN;
