@@ -13,6 +13,7 @@ import { handleWebhook } from "./webhookHandler";
 import { Settlement } from "./types";
 import { mountFunding } from "./funding/http";
 import { mountOfframp } from "./offramp";
+import { mountAirtime } from "./airtime";
 
 // Keep the receiver alive through background faults. The funding watcher polls an
 // external RPC that can rate-limit or blip; a stray rejection there must never
@@ -48,6 +49,9 @@ const funding = mountFunding();
 // Authenticated off-ramp initiation for the brain (needs PAJ_API_KEY +
 // INTERNAL_API_TOKEN). Fail-closed otherwise.
 const offramp = mountOfframp(cfg);
+// Authenticated airtime fulfilment for the brain (needs VTPASS_* +
+// INTERNAL_API_TOKEN). Fail-closed otherwise.
+const airtime = mountAirtime();
 
 async function handlePajWebhook(req: http.IncomingMessage, res: http.ServerResponse) {
   const chunks: Buffer[] = [];
@@ -71,6 +75,7 @@ const server = http.createServer(async (req, res) => {
     return handlePajWebhook(req, res);
   }
   if (await offramp.handle(req, res)) return; // /offramp* claimed it
+  if (await airtime.handle(req, res)) return; // /airtime claimed it
   if (await funding.handle(req, res)) return; // /funding/* claimed it
   res.writeHead(404).end();
 });
@@ -81,4 +86,5 @@ server.listen(PORT, () => {
   );
   funding.logStatus(PORT);
   offramp.logStatus(PORT);
+  airtime.logStatus(PORT);
 });
