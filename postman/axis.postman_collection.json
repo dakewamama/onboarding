@@ -1,0 +1,161 @@
+{
+  "info": {
+    "name": "Axis — live production tests",
+    "description": "Live endpoint tests for Axis across brain (chat + admin) and onboarding (money rails + custody). Fill the collection variables with your Railway hosts and tokens (secrets are variables, never committed). Airtime live-test order: 1) Custody: create user -> pubkey. 2) Onboarding: /airtime/link {userId, pubkey}. 3) Fund the pubkey with USDC (real, external) or /funding/address for a QR. 4) Onboarding: /airtime to charge+deliver, or chat via brain /webhooks/web.",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "BRAIN_URL", "value": "https://brain-xxxx.up.railway.app" },
+    { "key": "ONBOARDING_URL", "value": "https://onboarding-production-ca2d.up.railway.app" },
+    { "key": "CUSTODY_URL", "value": "https://custody-xxxx.up.railway.app" },
+    { "key": "INTERNAL_API_TOKEN", "value": "" },
+    { "key": "ADMIN_TOKEN", "value": "" },
+    { "key": "CUSTODY_API_TOKEN", "value": "" },
+    { "key": "WEB_WEBHOOK_TOKEN", "value": "" },
+    { "key": "userId", "value": "web:test-1" },
+    { "key": "walletAddress", "value": "" },
+    { "key": "phone", "value": "08031234567" },
+    { "key": "amount", "value": "100" },
+    { "key": "network", "value": "mtn" },
+    { "key": "bankCode", "value": "000013" },
+    { "key": "accountNumber", "value": "0123456789" }
+  ],
+  "item": [
+    {
+      "name": "Brain (chat + admin)",
+      "item": [
+        {
+          "name": "health",
+          "request": { "method": "GET", "header": [], "url": "{{BRAIN_URL}}/health" }
+        },
+        {
+          "name": "chat turn (web webhook)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "content-type", "value": "application/json" },
+              { "key": "authorization", "value": "Bearer {{WEB_WEBHOOK_TOKEN}}", "description": "only enforced when WEB_WEBHOOK_TOKEN is set on brain" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"text\": \"buy {{amount}} {{network}} airtime for {{phone}}\"\n}" },
+            "url": "{{BRAIN_URL}}/webhooks/web"
+          }
+        },
+        {
+          "name": "admin: model-check",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "authorization", "value": "Bearer {{ADMIN_TOKEN}}" }],
+            "url": "{{BRAIN_URL}}/admin/model-check"
+          }
+        },
+        {
+          "name": "admin: browse-check",
+          "request": {
+            "method": "GET",
+            "header": [{ "key": "authorization", "value": "Bearer {{ADMIN_TOKEN}}" }],
+            "url": "{{BRAIN_URL}}/admin/browse-check?q=oraimo powerbank"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Onboarding (money rails)",
+      "item": [
+        {
+          "name": "airtime: link user -> wallet",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "content-type", "value": "application/json" },
+              { "key": "authorization", "value": "Bearer {{INTERNAL_API_TOKEN}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"userId\": \"{{userId}}\",\n  \"address\": \"{{walletAddress}}\"\n}" },
+            "url": "{{ONBOARDING_URL}}/airtime/link"
+          }
+        },
+        {
+          "name": "airtime: buy (charge + deliver)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "content-type", "value": "application/json" },
+              { "key": "authorization", "value": "Bearer {{INTERNAL_API_TOKEN}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"owner\": \"{{userId}}\",\n  \"network\": \"{{network}}\",\n  \"amount\": {{amount}},\n  \"phone\": \"{{phone}}\",\n  \"idempotencyKey\": \"pm-{{$timestamp}}\"\n}" },
+            "url": "{{ONBOARDING_URL}}/airtime"
+          }
+        },
+        {
+          "name": "offramp: register bank (permanent address)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "content-type", "value": "application/json" },
+              { "key": "authorization", "value": "Bearer {{INTERNAL_API_TOKEN}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"bankCode\": \"{{bankCode}}\",\n  \"accountNumber\": \"{{accountNumber}}\"\n}" },
+            "url": "{{ONBOARDING_URL}}/offramp/register"
+          }
+        },
+        {
+          "name": "offramp: resolve account name",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "content-type", "value": "application/json" },
+              { "key": "authorization", "value": "Bearer {{INTERNAL_API_TOKEN}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"accountNumber\": \"{{accountNumber}}\"\n}" },
+            "url": "{{ONBOARDING_URL}}/offramp/resolve-account"
+          }
+        },
+        {
+          "name": "funding: deposit address (QR)",
+          "request": {
+            "method": "POST",
+            "header": [{ "key": "content-type", "value": "application/json" }],
+            "body": { "mode": "raw", "raw": "{\n  \"owner\": \"{{walletAddress}}\"\n}" },
+            "url": "{{ONBOARDING_URL}}/funding/address"
+          }
+        },
+        {
+          "name": "funding: balance",
+          "request": {
+            "method": "GET",
+            "header": [],
+            "url": "{{ONBOARDING_URL}}/funding/balance?owner={{walletAddress}}"
+          }
+        }
+      ]
+    },
+    {
+      "name": "Custody server",
+      "item": [
+        {
+          "name": "create user (-> pubkey/wallet)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "content-type", "value": "application/json" },
+              { "key": "authorization", "value": "Bearer {{CUSTODY_API_TOKEN}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"userId\": \"{{userId}}\"\n}" },
+            "url": "{{CUSTODY_URL}}/users"
+          }
+        },
+        {
+          "name": "authorize user (scope + per-tx cap)",
+          "request": {
+            "method": "POST",
+            "header": [
+              { "key": "content-type", "value": "application/json" },
+              { "key": "authorization", "value": "Bearer {{CUSTODY_API_TOKEN}}" }
+            ],
+            "body": { "mode": "raw", "raw": "{\n  \"scope\": [\"withdraw\"],\n  \"maxAmountPerTx\": 1000000\n}" },
+            "url": "{{CUSTODY_URL}}/users/{{userId}}/authorize"
+          }
+        }
+      ]
+    }
+  ]
+}
