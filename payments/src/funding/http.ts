@@ -17,6 +17,8 @@ import { loadFundingConfig } from "./config";
 export interface FundingMount {
   handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean>;
   logStatus(port: number): void;
+  /** Arm the deposit watch for a wallet (null when funding isn't configured). */
+  armWatch: ((owner: string) => void) | null;
 }
 
 export function mountFunding(): FundingMount {
@@ -125,7 +127,11 @@ export function mountFunding(): FundingMount {
     }
   }
 
-  return { handle, logStatus };
+  return {
+    handle,
+    logStatus,
+    armWatch: service ? (owner: string) => service!.armWatch(owner) : null,
+  };
 }
 
 function send(res: http.ServerResponse, status: number, body: unknown): void {

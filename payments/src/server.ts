@@ -50,8 +50,9 @@ const funding = mountFunding();
 // INTERNAL_API_TOKEN). Fail-closed otherwise.
 const offramp = mountOfframp(cfg);
 // Authenticated airtime fulfilment for the brain (needs VTPASS_* +
-// INTERNAL_API_TOKEN). Fail-closed otherwise.
-const airtime = mountAirtime();
+// INTERNAL_API_TOKEN). Shares funding's watch-armer so creating a user's wallet
+// also starts crediting its deposits.
+const airtime = mountAirtime(process.env, funding.armWatch);
 
 async function handlePajWebhook(req: http.IncomingMessage, res: http.ServerResponse) {
   const chunks: Buffer[] = [];
