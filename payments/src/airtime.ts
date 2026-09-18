@@ -7,6 +7,7 @@ import { SpendLedger, InsufficientBalanceError } from "./funding/spendLedger";
 import { fundingStoreDir } from "./funding/config";
 import { usdcToNgnRate } from "./rate";
 import { fulfillAirtime, AirtimeFulfillDeps } from "./airtimeFulfill";
+import { IdentityStore } from "./identity";
 
 /**
  * Authenticated airtime fulfilment, mounted next to the off-ramp + webhook
@@ -53,6 +54,7 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
   const storeDir = fundingStoreDir(env);
   const deposits = new DepositLedger(storeDir);
   const spends = new SpendLedger(storeDir);
+  const identity = new IdentityStore(storeDir);
   const deps: AirtimeFulfillDeps = {
     ngnPerUsdc: ngnPerUsdc ?? 0,
     marginBps,
@@ -77,7 +79,7 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
     res: http.ServerResponse,
   ): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
-    if (url.pathname !== "/airtime") return false;
+    if (url.pathname !== "/airtime" && url.pathname !== "/airtime/link") return false;
 
     if (!enabled) return void send(res, 503, { error: disabledReason }), true;
     if (!authorized(req)) return void send(res, 401, { error: "unauthorized" }), true;
@@ -85,16 +87,45 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
 
     try {
       const body = await readJson(req);
-      const owner = String(body.owner ?? "");
+
+      // Link a userId to its custodial wallet address once. Everything money keys
+      // off the address; this is what lets the airtime debit find the balance.
+      if (url.pathname === "/airtime/link") {
+        const userId = String(body.userId ?? "");
+        const address = String(body.address ?? "");
+        if (!userId || !address) {
+          return void send(res, 400, { error: "userId and address are required" }), true;
+        }
+        identity.link(userId, address);
+        return void send(res, 200, { userId, address }), true;
+      }
+
+      const rawOwner = String(body.owner ?? "");
       const network = String(body.network ?? "");
       const phone = String(body.phone ?? "");
       const idempotencyKey = String(body.idempotencyKey ?? "");
       const amount = body.amount != null ? Number(body.amount) : NaN;
-      if (!owner || !network || !phone || !idempotencyKey || !(amount > 0)) {
+      if (!rawOwner || !network || !phone || !idempotencyKey || !(amount > 0)) {
         return (
           void send(res, 400, {
             error:
               "owner, network, phone, idempotencyKey and a positive amount are required",
+          }),
+          true
+        );
+      }
+      // Resolve to the single money key: the custodial wallet address deposits are
+      // credited under. rawOwner is normally a userId; accept a linked address too.
+      let owner: string;
+      const mapped = identity.addressFor(rawOwner);
+      if (mapped) {
+        owner = mapped; // rawOwner was a userId
+      } else if (identity.userFor(rawOwner)) {
+        owner = rawOwner; // rawOwner was already the linked address
+      } else {
+        return (
+          void send(res, 409, {
+            error: "no wallet linked for this user; call /airtime/link first",
           }),
           true
         );
@@ -126,7 +157,7 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
   function logStatus(_port: number): void {
     console.log(
       enabled
-        ? `[airtime] authenticated airtime route enabled (/airtime, VTpass ${vtEnv})`
+        ? `[airtime] authenticated airtime routes enabled (/airtime, /airtime/link, VTpass ${vtEnv})`
         : `[airtime] disabled (${disabledReason})`,
     );
   }
