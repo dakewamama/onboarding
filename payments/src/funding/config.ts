@@ -29,6 +29,15 @@ export interface FundingConfig {
 // Real mainnet USDC (6 decimals). Same constant the Paj module pins.
 const MAINNET_USDC = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v";
 
+/** The durable funding store directory. Single source of truth, usable without
+ *  the RPC config (the airtime debit path needs the store, not the watcher). */
+export function fundingStoreDir(env: NodeJS.ProcessEnv = process.env): string {
+  return (
+    env.FUNDING_STORE_DIR ??
+    path.resolve(__dirname, "..", "..", ".funding-store")
+  );
+}
+
 export function loadFundingConfig(
   env: NodeJS.ProcessEnv = process.env
 ): FundingConfig {
@@ -56,9 +65,7 @@ export function loadFundingConfig(
       ? Number(env.FUNDING_POLL_INTERVAL_MS)
       : 60000,
     pageSize: env.FUNDING_PAGE_SIZE ? Number(env.FUNDING_PAGE_SIZE) : 10,
-    storeDir:
-      env.FUNDING_STORE_DIR ??
-      path.resolve(__dirname, "..", "..", ".funding-store"),
+    storeDir: fundingStoreDir(env),
     corsOrigins: (env.FUNDING_CORS_ORIGINS ?? "")
       .split(",")
       .map((o) => o.trim())
