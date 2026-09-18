@@ -8,6 +8,7 @@ import { fundingStoreDir } from "./funding/config";
 import { usdcToNgnRate } from "./rate";
 import { fulfillAirtime, AirtimeFulfillDeps } from "./airtimeFulfill";
 import { IdentityStore } from "./identity";
+import { provisionWallet } from "./custody";
 
 /**
  * Authenticated airtime fulfilment, mounted next to the off-ramp + webhook
@@ -79,17 +80,35 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
     res: http.ServerResponse,
   ): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
-    if (url.pathname !== "/airtime" && url.pathname !== "/airtime/link") return false;
+    const routes = ["/airtime", "/airtime/link", "/airtime/provision"];
+    if (!routes.includes(url.pathname)) return false;
 
-    if (!enabled) return void send(res, 503, { error: disabledReason }), true;
+    // Token gates everything. The VTpass/rate `enabled` gate applies only to the
+    // buy route below — provisioning/linking must work before airtime is keyed.
+    if (!token) return void send(res, 503, { error: "INTERNAL_API_TOKEN not set" }), true;
     if (!authorized(req)) return void send(res, 401, { error: "unauthorized" }), true;
     if (req.method !== "POST") return void send(res, 405, { error: "method" }), true;
 
     try {
       const body = await readJson(req);
 
-      // Link a userId to its custodial wallet address once. Everything money keys
-      // off the address; this is what lets the airtime debit find the balance.
+      // Provision a per-user custodial wallet (idempotent) and link it, so the user
+      // has a distinct deposit address deposits are attributed to. Needs only
+      // KEYSTORE_MASTER_KEY — independent of the VTpass/rate airtime config.
+      if (url.pathname === "/airtime/provision") {
+        const userId = String(body.userId ?? "");
+        if (!userId) return void send(res, 400, { error: "userId is required" }), true;
+        let wallet: { userId: string; address: string; created: boolean };
+        try {
+          wallet = provisionWallet(storeDir, userId, env);
+        } catch (e) {
+          return void send(res, 503, { error: (e as Error).message }), true;
+        }
+        identity.link(userId, wallet.address);
+        return void send(res, 200, wallet), true;
+      }
+
+      // Link a userId to an externally-provided wallet address (manual path).
       if (url.pathname === "/airtime/link") {
         const userId = String(body.userId ?? "");
         const address = String(body.address ?? "");
@@ -100,6 +119,8 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
         return void send(res, 200, { userId, address }), true;
       }
 
+      // From here on it's the buy route, which needs VTpass + rate configured.
+      if (!enabled) return void send(res, 503, { error: disabledReason }), true;
       const rawOwner = String(body.owner ?? "");
       const network = String(body.network ?? "");
       const phone = String(body.phone ?? "");
@@ -157,8 +178,8 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
   function logStatus(_port: number): void {
     console.log(
       enabled
-        ? `[airtime] authenticated airtime routes enabled (/airtime, /airtime/link, VTpass ${vtEnv})`
-        : `[airtime] disabled (${disabledReason})`,
+        ? `[airtime] routes enabled (/airtime buy + /airtime/provision + /airtime/link, VTpass ${vtEnv})`
+        : `[airtime] buy disabled (${disabledReason}); provision/link still available if INTERNAL_API_TOKEN is set`,
     );
   }
 
