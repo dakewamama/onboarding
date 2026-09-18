@@ -51,17 +51,20 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
   }
   const rateAvailable = Boolean(pajClient || staticRate);
 
-  async function getRate(): Promise<number> {
+  async function resolveRate(): Promise<{ rate: number; source: "paj" | "fallback" }> {
     if (pajClient) {
       try {
         const v = offRampNgnPerUsdc(await pajClient.getRate("NGN" as Currency));
-        if (v) return v;
+        if (v) return { rate: v, source: "paj" };
       } catch {
         // fall through to the static fallback
       }
     }
-    if (staticRate) return staticRate;
+    if (staticRate) return { rate: staticRate, source: "fallback" };
     throw new Error("no rate available (set PAJ_API_KEY or AXIS_USDC_NGN_RATE)");
+  }
+  async function getRate(): Promise<number> {
+    return (await resolveRate()).rate;
   }
 
   const marginBps = Number(env.AXIS_AIRTIME_MARGIN_BPS ?? 0) || 0;
@@ -102,13 +105,23 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
     res: http.ServerResponse,
   ): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
-    const routes = ["/airtime", "/airtime/link", "/airtime/provision"];
+    const routes = ["/airtime", "/airtime/link", "/airtime/provision", "/airtime/rate"];
     if (!routes.includes(url.pathname)) return false;
 
     // Token gates everything. The VTpass/rate `enabled` gate applies only to the
     // buy route below — provisioning/linking must work before airtime is keyed.
     if (!token) return void send(res, 503, { error: "INTERNAL_API_TOKEN not set" }), true;
     if (!authorized(req)) return void send(res, 401, { error: "unauthorized" }), true;
+
+    // Diagnostic: which rate is live and where from (proves Paj vs fallback). GET.
+    if (url.pathname === "/airtime/rate") {
+      try {
+        return void send(res, 200, await resolveRate()), true;
+      } catch (e) {
+        return void send(res, 503, { error: (e as Error).message }), true;
+      }
+    }
+
     if (req.method !== "POST") return void send(res, 405, { error: "method" }), true;
 
     try {
