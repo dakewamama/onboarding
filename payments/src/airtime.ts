@@ -28,7 +28,10 @@ export interface AirtimeMount {
   logStatus(port: number): void;
 }
 
-export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount {
+export function mountAirtime(
+  env: NodeJS.ProcessEnv = process.env,
+  armWatch?: ((owner: string) => void) | null,
+): AirtimeMount {
   const token = env.INTERNAL_API_TOKEN;
   const apiKey = env.VTPASS_API_KEY;
   const secretKey = env.VTPASS_SECRET_KEY;
@@ -105,7 +108,7 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
     res: http.ServerResponse,
   ): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
-    const routes = ["/airtime", "/airtime/link", "/airtime/provision", "/airtime/rate"];
+    const routes = ["/airtime", "/airtime/link", "/airtime/provision", "/airtime/rate", "/wallet"];
     if (!routes.includes(url.pathname)) return false;
 
     // Token gates everything. The VTpass/rate `enabled` gate applies only to the
@@ -127,10 +130,11 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
     try {
       const body = await readJson(req);
 
-      // Provision a per-user custodial wallet (idempotent) and link it, so the user
-      // has a distinct deposit address deposits are attributed to. Needs only
-      // KEYSTORE_MASTER_KEY — independent of the VTpass/rate airtime config.
-      if (url.pathname === "/airtime/provision") {
+      // THE user's wallet: create it once (idempotent), link userId <-> address,
+      // and arm the deposit watch so any USDC sent to it is credited. This is what
+      // auth calls — one wallet per user, billed for everything. (/airtime/provision
+      // is a legacy alias for the same thing.) Needs only KEYSTORE_MASTER_KEY.
+      if (url.pathname === "/wallet" || url.pathname === "/airtime/provision") {
         const userId = String(body.userId ?? "");
         if (!userId) return void send(res, 400, { error: "userId is required" }), true;
         let wallet: { userId: string; address: string; created: boolean };
@@ -140,6 +144,11 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
           return void send(res, 503, { error: (e as Error).message }), true;
         }
         identity.link(userId, wallet.address);
+        try {
+          armWatch?.(wallet.address); // credit deposits to this wallet automatically
+        } catch {
+          // watch arming is best-effort; balance still reconciles once armed
+        }
         return void send(res, 200, wallet), true;
       }
 
@@ -213,8 +222,8 @@ export function mountAirtime(env: NodeJS.ProcessEnv = process.env): AirtimeMount
   function logStatus(_port: number): void {
     console.log(
       enabled
-        ? `[airtime] routes enabled (/airtime buy + /airtime/provision + /airtime/link, VTpass ${vtEnv})`
-        : `[airtime] buy disabled (${disabledReason}); provision/link still available if INTERNAL_API_TOKEN is set`,
+        ? `[airtime] routes enabled (/airtime buy + /wallet + /airtime/link, VTpass ${vtEnv})`
+        : `[airtime] buy disabled (${disabledReason}); /wallet still available if INTERNAL_API_TOKEN is set`,
     );
   }
 

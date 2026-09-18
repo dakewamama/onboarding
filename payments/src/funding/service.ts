@@ -45,6 +45,12 @@ export class FundingService {
     this.watcher.start();
   }
 
+  /** Arm the deposit watch for a wallet so any USDC sent to it gets credited.
+   *  Called when a user's wallet is created, so deposits "just work". Idempotent. */
+  armWatch(owner: string): void {
+    this.watcher.watch(owner);
+  }
+
   stop(): void {
     this.watcher.stop();
   }
