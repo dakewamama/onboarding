@@ -108,13 +108,36 @@ export function mountAirtime(
     res: http.ServerResponse,
   ): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
-    const routes = ["/airtime", "/airtime/link", "/airtime/provision", "/airtime/rate", "/wallet"];
+    const routes = ["/airtime", "/airtime/link", "/airtime/provision", "/airtime/rate", "/wallet", "/wallet/balance"];
     if (!routes.includes(url.pathname)) return false;
 
     // Token gates everything. The VTpass/rate `enabled` gate applies only to the
     // buy route below — provisioning/linking must work before airtime is keyed.
     if (!token) return void send(res, 503, { error: "INTERNAL_API_TOKEN not set" }), true;
     if (!authorized(req)) return void send(res, 401, { error: "unauthorized" }), true;
+
+    // Spendable balance for a user (deposits minus spends), with an NGN estimate.
+    // GET ?userId=... — resolves the user's wallet, sums the ledgers. No wallet or
+    // no deposits => 0, not an error.
+    if (url.pathname === "/wallet/balance") {
+      const userId = url.searchParams.get("userId") ?? "";
+      if (!userId) return void send(res, 400, { error: "userId required" }), true;
+      const address = identity.addressFor(userId);
+      const base = address
+        ? deposits.balanceBaseUnits(address) - spends.spentBaseUnits(address)
+        : BigInt(0);
+      const usdc = Number(base) / 1e6;
+      let ngn: number | null = null;
+      try {
+        ngn = Math.floor(usdc * (await getRate()));
+      } catch {
+        ngn = null;
+      }
+      return (
+        void send(res, 200, { userId, baseUnits: base.toString(), usdc, ngn }),
+        true
+      );
+    }
 
     // Diagnostic: which rate is live and where from (proves Paj vs fallback). GET.
     if (url.pathname === "/airtime/rate") {
