@@ -18,7 +18,7 @@ RUN apt-get update \
   && apt-get install -y --no-install-recommends python3 make g++ \
   && npm init -y >/dev/null 2>&1 \
   && npm install --no-audit --no-fund \
-      ts-node@10 typescript@5 @types/node@20 \
+      typescript@5 @types/node@20 \
       @solana/web3.js@1 @solana/spl-token@0.4 \
   && apt-get purge -y python3 make g++ \
   && apt-get autoremove -y \
@@ -26,6 +26,10 @@ RUN apt-get update \
 
 COPY tsconfig.json ./
 COPY payments ./payments
+
+# Compile ahead of time and run plain node — faster boots, lower memory, and a
+# clean SIGTERM exit (no ts-node/npm wrapper turning shutdown into a false crash).
+RUN npx tsc -p payments/tsconfig.json
 
 # Railway injects PORT at runtime; this is just a local default.
 ENV PORT=8080
@@ -41,4 +45,4 @@ EXPOSE 8080
 # ("use Railway Volumes" instead); the mount is configured on the service.
 ENV FUNDING_STORE_DIR=/data
 
-CMD ["npx", "ts-node", "--project", "payments/tsconfig.json", "payments/src/server.ts"]
+CMD ["node", "payments/dist/server.js"]
