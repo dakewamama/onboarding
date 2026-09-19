@@ -72,6 +72,11 @@ async function handlePajWebhook(req: http.IncomingMessage, res: http.ServerRespo
 }
 
 const server = http.createServer(async (req, res) => {
+  if (req.method === "GET" && (req.url === "/health" || req.url === "/")) {
+    res.writeHead(200, { "content-type": "application/json" });
+    res.end(JSON.stringify({ ok: true, env: cfg.env, mode: cfg.mode }));
+    return;
+  }
   if (req.method === "POST" && req.url === "/webhooks/paj") {
     return handlePajWebhook(req, res);
   }
