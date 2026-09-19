@@ -94,3 +94,14 @@ server.listen(PORT, () => {
   offramp.logStatus(PORT);
   airtime.logStatus(PORT);
 });
+
+// Graceful shutdown: Railway sends SIGTERM to the old container on every redeploy.
+// Close the server and exit 0 so it's a clean stop, not a "Deployment crashed"
+// false alarm. Force-exit if something (e.g. the deposit watcher interval) hangs.
+function shutdown(signal: string): void {
+  console.log(`[server] ${signal} received; shutting down cleanly`);
+  server.close(() => process.exit(0));
+  setTimeout(() => process.exit(0), 5000).unref();
+}
+process.on("SIGTERM", () => shutdown("SIGTERM"));
+process.on("SIGINT", () => shutdown("SIGINT"));
