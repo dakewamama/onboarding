@@ -3,6 +3,7 @@ import { fromBaseUnits, toBaseUnits } from "../money";
 import { FundingConfig, loadFundingConfig } from "./config";
 import { DepositLedger, CreditRecord } from "./depositLedger";
 import { UsdcWatcher } from "./usdcWatcher";
+import { SolWatcher } from "./solWatcher";
 import { TransferBuilder, BuiltTransfer } from "./transferBuilder";
 
 export interface DepositAddress {
@@ -27,6 +28,7 @@ export class FundingService {
   readonly config: FundingConfig;
   readonly ledger: DepositLedger;
   readonly watcher: UsdcWatcher;
+  readonly solWatcher: SolWatcher;
   readonly builder: TransferBuilder;
 
   constructor(
@@ -37,12 +39,16 @@ export class FundingService {
     this.ledger = new DepositLedger(config.storeDir);
     const connection = new Connection(config.rpcUrl, config.commitment);
     this.watcher = new UsdcWatcher(config, this.ledger, onCredit, connection);
+    // Native SOL is accepted too (so users have gas for outbound Paj transfers
+    // until a fee-payer relayer exists). Shares the ledger, watchlist, and RPC.
+    this.solWatcher = new SolWatcher(config, this.ledger, onCredit, connection);
     this.builder = new TransferBuilder(config, connection);
   }
 
-  /** Start the background deposit watcher. */
+  /** Start the background deposit watchers (USDC + SOL). */
   start(): void {
     this.watcher.start();
+    this.solWatcher.start();
   }
 
   /** Arm the deposit watch for a wallet so any USDC sent to it gets credited.
@@ -53,6 +59,7 @@ export class FundingService {
 
   stop(): void {
     this.watcher.stop();
+    this.solWatcher.stop();
   }
 
   /**
@@ -104,9 +111,13 @@ export class FundingService {
 }
 
 function defaultLog(r: CreditRecord): void {
+  const via =
+    r.asset === "sol" && r.lamports
+      ? ` [from ${Number(r.lamports) / 1e9} SOL @ ${r.priceUsdcPerSol}]`
+      : "";
   console.log(
     `[funding] credited ${fromBaseUnits(BigInt(r.baseUnits))} USDC to ${r.owner} ` +
-      `(sig=${r.signature}, ${r.commitment})`
+      `(sig=${r.signature}, ${r.commitment})${via}`
   );
 }
 
