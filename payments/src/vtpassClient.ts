@@ -58,6 +58,18 @@ export function buildRequestId(
   return `${stamp}${suffix}`;
 }
 
+/**
+ * A DETERMINISTIC request_id for an idempotency key: the same key always maps
+ * to the same request_id, so a retry after an ambiguous outcome replays the
+ * same VTpass purchase (VTpass dedupes on request_id) instead of buying twice.
+ * The datetime stamp is of "now" (when the first attempt is made); the suffix
+ * is a hash of the key, so it is unique per key and stable across retries.
+ */
+export function requestIdForKey(idempotencyKey: string, now: Date = new Date()): string {
+  const suffix = createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 12);
+  return buildRequestId(now, suffix);
+}
+
 export interface AirtimeResult {
   /** code "000" AND status "delivered". */
   success: boolean;
