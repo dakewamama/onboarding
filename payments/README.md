@@ -130,3 +130,55 @@ to a `UNIQUE` constraint on the signature).
 ## Still open (ask support@paj.cash)
 
 Fee schedule, rate limits, and whether a private status-fetch endpoint exists.
+
+## Airtime ambiguity and reconciliation
+
+`POST /airtime` and `GET /airtime/status?idempotencyKey=...` require the existing
+`INTERNAL_API_TOKEN` bearer token. These are internal service endpoints, not
+user-facing grants. Status lookup does not require a conversion rate.
+
+Each purchase records its owner, stable Axis action key, parameter fingerprint,
+creation timestamp, and `IN_DOUBT` debit before contacting VTpass. The provider ID
+is derived from that key/owner and the persisted timestamp, never the retry clock.
+This preserves VTpass's [Lagos timestamp prefix requirement](https://vtpass.com/documentation/how-to-generate-request-id/).
+A repeated purchase request returns its recorded state; it never submits another
+`/pay`. Reusing the key with changed purchase parameters returns HTTP 409.
+
+Timeouts, malformed responses, unknown statuses and duplicate-provider-ID responses
+retain the debit. `in_doubt` and `pending` return HTTP 202, not ordinary failure.
+The status endpoint calls VTpass's [POST /requery](https://vtpass.com/documentation/re-query-services/)
+with the original request ID. A correlated delivered verdict settles the debit;
+a confirmed failed verdict releases it; a confirmed reversed verdict reverses it.
+Unknown/missing/mismatched requery responses remain `IN_DOUBT`. The response has
+`status` (`delivered`, `pending`, `failed`, `in_doubt`) and `moneyState`
+(`SETTLED`, `PENDING`, `RELEASED`, `REVERSED`, `IN_DOUBT`). Unknown local keys also
+return HTTP 202: absence of a local receipt is not evidence of provider failure.
+
+Released/reversed records are retained as idempotency tombstones and excluded
+from the debit total. Pending/unknown debits are excluded from settled pool gain.
+Legacy filenames remain readable; new keys use SHA-256 filenames to prevent
+punctuation collisions. No bulk data migration is needed. Legacy airtime records
+without a reproducible provider ID remain in doubt and require manual
+reconciliation; the service neither invents an ID nor resubmits them.
+
+Scope and limits: this patch uses the existing file ledger and supports a single
+service process with a persistent funding-store directory. It does not establish
+multi-process transactional accounting or replace the ledger with a database.
+A crash after reservation but before submission can leave funds in doubt; only
+an authoritative verdict/manual reconciliation can release them. No timer or new
+workflow engine is added. The caller drives status polling. Provider transport
+has a 30-second timeout. Automated tests use explicit provider doubles; no live
+VTpass purchase was made. This remains a draft, not production certification.
+
+Validation without production credentials:
+
+```sh
+npm run typecheck:payments
+npm run typecheck:offline
+npm run test:offline
+```
+
+`npm test` retains the full Anchor suite and requires the configured validator,
+program artifacts, `ANCHOR_PROVIDER_URL`, and test wallet. The root tsconfig also
+includes the separate client project; use its own configuration/dependencies for
+client validation. No new environment variables are required by this patch.

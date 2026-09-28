@@ -1,5 +1,8 @@
 import * as fs from "fs";
 import * as path from "path";
+import { createHash, randomUUID } from "crypto";
+
+export type SpendState = "IN_DOUBT" | "PENDING" | "SETTLED" | "RELEASED" | "REVERSED";
 
 /**
  * Durable, restart-safe ledger of SPENDS (debits) — the missing debit path.
@@ -32,6 +35,9 @@ export interface SpendRecord {
   remnantBaseUnits: string;
   reason: string;
   at: string;
+  state?: SpendState;
+  provider?: "vtpass";
+  requestFingerprint?: string;
 }
 
 export class InsufficientBalanceError extends Error {
@@ -65,34 +71,51 @@ export class SpendLedger {
   }
 
   private spendPath(owner: string, key: string): string {
-    return path.join(this.ownerDir(owner), `${safe(key)}.json`);
+    return path.join(this.ownerDir(owner), `${createHash("sha256").update(key).digest("hex")}.json`);
   }
 
   hasSpent(owner: string, idempotencyKey: string): boolean {
-    return fs.existsSync(this.spendPath(owner, idempotencyKey));
+    const record = this.get(owner, idempotencyKey);
+    return record !== null && record.state !== "RELEASED" && record.state !== "REVERSED";
   }
 
-  /**
-   * Release a reservation — used when delivery fails AFTER the debit was recorded,
-   * so the funds return to available. Returns true if a record was removed. A real
-   * DB deployment writes a compensating entry inside the same transaction instead
-   * of deleting; deletion is the file-store equivalent and keeps balance derived.
-   */
-  void(owner: string, idempotencyKey: string): boolean {
-    const p = this.spendPath(owner, idempotencyKey);
-    if (!fs.existsSync(p)) return false;
-    fs.unlinkSync(p);
-    return true;
+  private existingPath(owner: string, key: string): string {
+    const current = this.spendPath(owner, key);
+    if (fs.existsSync(current)) return current;
+    return path.join(this.ownerDir(owner), `${safe(key)}.json`); // legacy store
   }
 
-  private read(owner: string, key: string): SpendRecord | null {
+  get(owner: string, key: string): SpendRecord | null {
     try {
-      return JSON.parse(
-        fs.readFileSync(this.spendPath(owner, key), "utf8"),
-      ) as SpendRecord;
-    } catch {
-      return null;
+      const record = JSON.parse(fs.readFileSync(this.existingPath(owner, key), "utf8")) as SpendRecord;
+      if (record.owner !== owner || record.idempotencyKey !== key) throw new Error("spend identity collision");
+      return record;
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return null;
+      throw err; // corrupt accounting must fail closed
     }
+  }
+
+  /** Service-authenticated status lookup. Ambiguous cross-owner keys fail closed. */
+  findByKey(key: string): SpendRecord | null {
+    const records = fs.readdirSync(path.join(this.dir, "spent"))
+      .flatMap(owner => this.recordsInDir(path.join(this.dir, "spent", owner)))
+      .filter(record => record.idempotencyKey === key);
+    if (records.length > 1) throw new Error("ambiguous action key");
+    return records[0] ?? null;
+  }
+
+  setState(owner: string, key: string, state: SpendState): SpendRecord {
+    const record = this.get(owner, key);
+    if (!record) throw new Error("unknown spend");
+    // A stale pending/unknown reply must never undo a terminal verdict.
+    if (["SETTLED", "RELEASED", "REVERSED"].includes(record.state ?? "")) return record;
+    const updated = { ...record, state };
+    const target = this.existingPath(owner, key);
+    const temp = `${target}.${randomUUID()}.tmp`;
+    fs.writeFileSync(temp, JSON.stringify(updated, null, 2), { flag: "wx" });
+    fs.renameSync(temp, target);
+    return updated;
   }
 
   /**
@@ -108,6 +131,8 @@ export class SpendLedger {
       paidBaseUnits: bigint;
       costBaseUnits: bigint;
       reason: string;
+      provider?: "vtpass";
+      requestFingerprint?: string;
     },
     availableBaseUnits: bigint,
   ): SpendResult {
@@ -117,7 +142,7 @@ export class SpendLedger {
     if (costBaseUnits < BigInt(0)) throw new Error("cost cannot be negative");
     if (costBaseUnits > paidBaseUnits) throw new Error("cost cannot exceed paid");
 
-    const existing = this.read(owner, idempotencyKey);
+    const existing = this.get(owner, idempotencyKey);
     if (existing) return { applied: false, duplicate: true, record: existing };
 
     if (paidBaseUnits > availableBaseUnits) {
@@ -132,6 +157,7 @@ export class SpendLedger {
       remnantBaseUnits: (paidBaseUnits - costBaseUnits).toString(),
       reason,
       at: new Date().toISOString(),
+      ...(input.provider ? { provider: input.provider, requestFingerprint: input.requestFingerprint, state: "IN_DOUBT" as const } : {}),
     };
     fs.mkdirSync(this.ownerDir(owner), { recursive: true });
     try {
@@ -147,7 +173,7 @@ export class SpendLedger {
         return {
           applied: false,
           duplicate: true,
-          record: this.read(owner, idempotencyKey) ?? record,
+          record: this.get(owner, idempotencyKey) ?? record,
         };
       }
       throw err;
@@ -156,7 +182,7 @@ export class SpendLedger {
 
   /** Total charged to an owner (sum of paid), integer base units. */
   spentBaseUnits(owner: string): bigint {
-    return this.records(owner).reduce(
+    return this.records(owner).filter(r => r.state !== "RELEASED" && r.state !== "REVERSED").reduce(
       (sum, r) => sum + BigInt(r.paidBaseUnits),
       BigInt(0),
     );
@@ -169,7 +195,7 @@ export class SpendLedger {
     let total = BigInt(0);
     for (const owner of fs.readdirSync(spentRoot)) {
       for (const r of this.recordsInDir(path.join(spentRoot, owner))) {
-        total += BigInt(r.remnantBaseUnits);
+        if (r.state === undefined || r.state === "SETTLED") total += BigInt(r.remnantBaseUnits);
       }
     }
     return total;

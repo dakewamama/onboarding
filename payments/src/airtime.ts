@@ -1,12 +1,12 @@
 import * as http from "http";
 import { URL } from "url";
 import { timingSafeEqual } from "crypto";
-import { VtpassClient, VtpassEnv } from "./vtpassClient";
+import { VtpassClient, VtpassEnv, serviceIdFor } from "./vtpassClient";
 import { DepositLedger } from "./funding/depositLedger";
 import { SpendLedger, InsufficientBalanceError } from "./funding/spendLedger";
 import { fundingStoreDir } from "./funding/config";
 import { usdcToNgnRate, offRampNgnPerUsdc } from "./rate";
-import { fulfillAirtime, AirtimeFulfillDeps } from "./airtimeFulfill";
+import { fulfillAirtime, requeryAirtime, AirtimeIdentityConflict, AirtimeFulfillDeps } from "./airtimeFulfill";
 import { IdentityStore } from "./identity";
 import { provisionWallet } from "./custody";
 import { PajClient } from "./pajClient";
@@ -19,9 +19,9 @@ import type { Currency } from "./types";
  * the public URL can't.
  *
  * It RESERVES the debit (SpendLedger, balance-checked + idempotent), DELIVERS via
- * VTpass, and VOIDS the debit if delivery hard-fails — so a user is never charged
- * for airtime that didn't go out. The remnant (paid − cost) is booked as pool
- * gain. Fail-closed: missing VTpass keys, token, or rate => 503.
+ * VTpass, and releases the debit only on confirmed failure. The remnant is
+ * booked as pool gain only once settled. Unknown results retain the debit as
+ * IN_DOUBT. Missing VTpass keys, token, or rate prevents new purchases.
  */
 export interface AirtimeMount {
   handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean>;
@@ -90,7 +90,10 @@ export function mountAirtime(
     availableBaseUnits: (owner) =>
       deposits.balanceBaseUnits(owner) - spends.spentBaseUnits(owner),
     spend: (input, avail) => spends.spend(input, avail),
-    voidSpend: (owner, key) => spends.void(owner, key),
+    getSpend: (owner, key) => spends.get(owner, key),
+    findSpend: key => spends.findByKey(key),
+    setState: (owner, key, state) => spends.setState(owner, key, state),
+    requery: requestId => client!.requery(requestId),
     buyAirtime: (p) => client!.buyAirtime(p),
   };
 
@@ -108,13 +111,26 @@ export function mountAirtime(
     res: http.ServerResponse,
   ): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
-    const routes = ["/airtime", "/airtime/link", "/airtime/provision", "/airtime/rate", "/wallet", "/wallet/balance"];
+    const routes = ["/airtime/status", "/airtime", "/airtime/link", "/airtime/provision", "/airtime/rate", "/wallet", "/wallet/balance"];
     if (!routes.includes(url.pathname)) return false;
 
     // Token gates everything. The VTpass/rate `enabled` gate applies only to the
     // buy route below — provisioning/linking must work before airtime is keyed.
     if (!token) return void send(res, 503, { error: "INTERNAL_API_TOKEN not set" }), true;
     if (!authorized(req)) return void send(res, 401, { error: "unauthorized" }), true;
+
+    if (url.pathname === "/airtime/status") {
+      if (req.method !== "GET") return void send(res, 405, { error: "method" }), true;
+      const key = url.searchParams.get("idempotencyKey");
+      if (!key) return void send(res, 400, { error: "idempotencyKey required" }), true;
+      try {
+        const verdict = await requeryAirtime(deps, key);
+        if (!verdict) return void send(res, 202, { status: "in_doubt", moneyState: "IN_DOUBT" }), true;
+        return void send(res, verdict.status === "in_doubt" || verdict.status === "pending" ? 202 : 200, verdict), true;
+      } catch {
+        return void send(res, 202, { status: "in_doubt", moneyState: "IN_DOUBT" }), true;
+      }
+    }
 
     // Spendable balance for a user (deposits minus spends), with an NGN estimate.
     // GET ?userId=... — resolves the user's wallet, sums the ledgers. No wallet or
@@ -151,7 +167,12 @@ export function mountAirtime(
     if (req.method !== "POST") return void send(res, 405, { error: "method" }), true;
 
     try {
-      const body = await readJson(req);
+      let body: Record<string, unknown>;
+      try {
+        body = await readJson(req);
+      } catch {
+        return void send(res, 400, { error: "invalid JSON" }), true;
+      }
 
       // THE user's wallet: create it once (idempotent), link userId <-> address,
       // and arm the deposit watch so any USDC sent to it is credited. This is what
@@ -193,7 +214,7 @@ export function mountAirtime(
       const phone = String(body.phone ?? "");
       const idempotencyKey = String(body.idempotencyKey ?? "");
       const amount = body.amount != null ? Number(body.amount) : NaN;
-      if (!rawOwner || !network || !phone || !idempotencyKey || !(amount > 0)) {
+      if (!rawOwner || !network || !phone || !idempotencyKey || !Number.isFinite(amount) || !(amount > 0) || !serviceIdFor(network)) {
         return (
           void send(res, 400, {
             error:
@@ -226,19 +247,20 @@ export function mountAirtime(
         idempotencyKey,
       });
       const status =
-        result.status === "delivered" || result.status === "duplicate"
+        result.status === "delivered"
           ? 200
-          : result.status === "pending"
+          : (result.status === "pending" || result.status === "in_doubt")
             ? 202
             : 502; // failed
       return void send(res, status, result), true;
     } catch (err) {
+      if (err instanceof AirtimeIdentityConflict) return void send(res, 409, { error: err.message }), true;
       if (err instanceof InsufficientBalanceError) {
         return void send(res, 402, { error: "insufficient balance" }), true;
       }
       // Never leak the key; surface a generic error.
       console.error("[airtime] error", (err as Error).message);
-      return void send(res, 502, { error: "airtime delivery failed" }), true;
+      return void send(res, 202, { status: "in_doubt", moneyState: "IN_DOUBT" }), true;
     }
   }
 

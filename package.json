@@ -8,7 +8,10 @@
     "paj-webhook-server": "ts-node --project payments/tsconfig.json payments/src/server.ts",
     "paj-verify-receiver": "ts-node --project payments/tsconfig.json payments/src/verifyReceiver.ts",
     "funding-selfcheck": "ts-node --project payments/tsconfig.json payments/src/funding/selfcheck.ts",
-    "funding-rpccheck": "ts-node --project payments/tsconfig.json payments/src/funding/rpccheck.ts"
+    "funding-rpccheck": "ts-node --project payments/tsconfig.json payments/src/funding/rpccheck.ts",
+    "typecheck:payments": "tsc --noEmit -p payments/tsconfig.json",
+    "typecheck:offline": "tsc -p tsconfig.offline.json",
+    "test:offline": "ts-mocha -p tsconfig.offline.json -t 10000 \"tests/**/*.ts\" --ignore tests/onboarding-pool.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1",

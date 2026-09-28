@@ -1,3 +1,5 @@
+import { createHash } from "crypto";
+
 /**
  * VTpass client — the airtime fulfilment rail (stopgap until Airbills' USDC-on-
  * Solana API ships). This is the only place that talks to VTpass outbound with
@@ -47,8 +49,8 @@ export function serviceIdFor(network: string): string | null {
  * `suffix` are injectable for deterministic tests.
  */
 export function buildRequestId(
-  now: Date = new Date(),
-  suffix: string = Math.random().toString(36).slice(2, 12),
+  now: Date,
+  suffix: string,
 ): string {
   const lagos = new Date(now.getTime() + 60 * 60 * 1000); // UTC+1
   const p = (n: number) => String(n).padStart(2, "0");
@@ -58,16 +60,12 @@ export function buildRequestId(
   return `${stamp}${suffix}`;
 }
 
-/**
- * A DETERMINISTIC request_id for an idempotency key: the same key always maps
- * to the same request_id, so a retry after an ambiguous outcome replays the
- * same VTpass purchase (VTpass dedupes on request_id) instead of buying twice.
- * The datetime stamp is of "now" (when the first attempt is made); the suffix
- * is a hash of the key, so it is unique per key and stable across retries.
- */
-export function requestIdForKey(idempotencyKey: string, now: Date = new Date()): string {
-  const suffix = createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 12);
-  return buildRequestId(now, suffix);
+/** Derive from the stable action key AND its persisted creation time. Never
+ * pass the retry clock: VTpass requires a Lagos timestamp prefix. */
+export function requestIdForKey(idempotencyKey: string, createdAt: Date): string {
+  if (!Number.isFinite(createdAt.getTime())) throw new Error("invalid action creation time");
+  const suffix = createHash("sha256").update(idempotencyKey).digest("hex").slice(0, 32);
+  return buildRequestId(createdAt, suffix);
 }
 
 export interface AirtimeResult {
@@ -84,8 +82,10 @@ export interface AirtimeResult {
 
 /** Parse a VTpass /pay response into a typed result. Pure + testable. */
 export function parseVtpassResult(json: unknown): AirtimeResult {
-  const j = (json ?? {}) as Record<string, any>;
-  const tx = (j.content?.transactions ?? {}) as Record<string, any>;
+  const object = (v: unknown): Record<string, unknown> =>
+    v !== null && typeof v === "object" && !Array.isArray(v) ? v as Record<string, unknown> : {};
+  const j = object(json);
+  const tx = object(object(j.content).transactions);
   const code = String(j.code ?? "");
   const status = String(tx.status ?? "unknown");
   return {
@@ -110,28 +110,48 @@ export class VtpassClient {
     network: string;
     amount: number;
     phone: string;
-    requestId?: string;
+    requestId: string;
   }): Promise<AirtimeResult> {
     const serviceID = serviceIdFor(params.network);
     if (!serviceID) throw new Error(`unsupported network: ${params.network}`);
+    if (!params.requestId) throw new Error("stable requestId required");
     if (!(params.amount > 0)) throw new Error("amount must be positive");
 
     const res = await fetch(`${this.base()}/pay`, {
       method: "POST",
+      signal: AbortSignal.timeout(30_000),
       headers: {
         "api-key": this.cfg.apiKey,
         "secret-key": this.cfg.secretKey,
         "Content-Type": "application/json",
       },
       body: JSON.stringify({
-        request_id: params.requestId ?? buildRequestId(),
+        request_id: params.requestId,
         serviceID,
         amount: params.amount,
         phone: params.phone,
       }),
     });
     const json = await res.json().catch(() => ({}));
-    return parseVtpassResult(json);
+    return !res.ok ? parseVtpassResult({}) : parseVtpassResult(json);
+  }
+
+  /** Query the original purchase; never submit a second /pay. */
+  async requery(requestId: string): Promise<AirtimeResult> {
+    const res = await fetch(`${this.base()}/requery`, {
+      method: "POST",
+      signal: AbortSignal.timeout(30_000),
+      headers: {
+        "api-key": this.cfg.apiKey,
+        "secret-key": this.cfg.secretKey,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({ request_id: requestId }),
+    });
+    const json: unknown = await res.json().catch(() => ({}));
+    const result = !res.ok ? parseVtpassResult({}) : parseVtpassResult(json);
+    // Missing/mismatched correlation cannot authorize a money transition.
+    return result.requestId === requestId ? result : parseVtpassResult({});
   }
 
   /** Reseller wallet balance (NGN). Uses the GET-style public-key auth. */
