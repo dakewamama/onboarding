@@ -157,7 +157,12 @@ export class SpendLedger {
       remnantBaseUnits: (paidBaseUnits - costBaseUnits).toString(),
       reason,
       at: new Date().toISOString(),
-      ...(input.provider ? { provider: input.provider, requestFingerprint: input.requestFingerprint, state: "IN_DOUBT" as const } : {}),
+      ...(input.requestFingerprint
+        ? { requestFingerprint: input.requestFingerprint }
+        : {}),
+      ...(input.provider
+        ? { provider: input.provider, state: "IN_DOUBT" as const }
+        : {}),
     };
     fs.mkdirSync(this.ownerDir(owner), { recursive: true });
     try {
