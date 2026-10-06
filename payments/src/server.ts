@@ -14,6 +14,7 @@ import { Settlement } from "./types";
 import { mountFunding } from "./funding/http";
 import { mountOfframp } from "./offramp";
 import { mountAirtime } from "./airtime";
+import { mountCustodyTransfer } from "./custodyTransferHttp";
 
 // Keep the receiver alive through background faults. The funding watcher polls an
 // external RPC that can rate-limit or blip; a stray rejection there must never
@@ -53,6 +54,8 @@ const offramp = mountOfframp(cfg);
 // INTERNAL_API_TOKEN). Shares funding's watch-armer so creating a user's wallet
 // also starts crediting its deposits.
 const airtime = mountAirtime(process.env, funding.armWatch);
+const custody = mountCustodyTransfer(process.env);
+const custodyTransfer = mountCustodyTransfer(process.env);
 
 async function handlePajWebhook(req: http.IncomingMessage, res: http.ServerResponse) {
   const chunks: Buffer[] = [];
@@ -80,8 +83,10 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/webhooks/paj") {
     return handlePajWebhook(req, res);
   }
+  if (await custodyTransfer.handle(req, res)) return;
   if (await offramp.handle(req, res)) return; // /offramp* claimed it
-  if (await airtime.handle(req, res)) return; // /airtime claimed it
+  if (await airtime.handle(req, res)) return;
+  if (await custody.handle(req, res)) return; // /airtime claimed it
   if (await funding.handle(req, res)) return; // /funding/* claimed it
   res.writeHead(404).end();
 });
@@ -91,8 +96,10 @@ server.listen(PORT, () => {
     `Paj webhook receiver on http://localhost:${PORT}/webhooks/paj (env=${cfg.env}, mode=${cfg.mode})`
   );
   funding.logStatus(PORT);
+  custodyTransfer.logStatus(PORT);
   offramp.logStatus(PORT);
   airtime.logStatus(PORT);
+  custody.logStatus(PORT);
 });
 
 // Graceful shutdown: Railway sends SIGTERM to the old container on every redeploy.
