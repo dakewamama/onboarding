@@ -2,8 +2,8 @@ import * as http from "http";
 import { URL } from "url";
 import { timingSafeEqual } from "crypto";
 import { VtpassClient, VtpassEnv, serviceIdFor } from "./vtpassClient";
-import { DepositLedger } from "./funding/depositLedger";
-import { SpendLedger, InsufficientBalanceError } from "./funding/spendLedger";
+import { InsufficientBalanceError } from "./funding/spendLedger";
+import { openMoneyLedger } from "./funding/moneyLedger";
 import { fundingStoreDir } from "./funding/config";
 import { usdcToNgnRate, offRampNgnPerUsdc } from "./rate";
 import { fulfillAirtime, requeryAirtime, AirtimeIdentityConflict, AirtimeFulfillDeps } from "./airtimeFulfill";
@@ -81,18 +81,15 @@ export function mountAirtime(
         : "";
 
   const storeDir = fundingStoreDir(env);
-  const deposits = new DepositLedger(storeDir);
-  const spends = new SpendLedger(storeDir);
+  const ledger = openMoneyLedger(env, storeDir);
   const identity = new IdentityStore(storeDir);
   const deps: AirtimeFulfillDeps = {
     getRate,
     marginBps,
-    availableBaseUnits: (owner) =>
-      deposits.balanceBaseUnits(owner) - spends.spentBaseUnits(owner),
-    spend: (input, avail) => spends.spend(input, avail),
-    getSpend: (owner, key) => spends.get(owner, key),
-    findSpend: key => spends.findByKey(key),
-    setState: (owner, key, state) => spends.setState(owner, key, state),
+    spend: input => ledger.spend(input),
+    getSpend: (owner, key) => ledger.get(owner, key),
+    findSpend: key => ledger.findByKey(key),
+    setState: (owner, key, state) => ledger.setState(owner, key, state),
     requery: requestId => client!.requery(requestId),
     buyAirtime: (p) => client!.buyAirtime(p),
   };
@@ -140,7 +137,7 @@ export function mountAirtime(
       if (!userId) return void send(res, 400, { error: "userId required" }), true;
       const address = identity.addressFor(userId);
       const base = address
-        ? deposits.balanceBaseUnits(address) - spends.spentBaseUnits(address)
+        ? await ledger.availableBaseUnits(address)
         : BigInt(0);
       const usdc = Number(base) / 1e6;
       let ngn: number | null = null;

@@ -11,12 +11,15 @@
     "funding-rpccheck": "ts-node --project payments/tsconfig.json payments/src/funding/rpccheck.ts",
     "typecheck:payments": "tsc --noEmit -p payments/tsconfig.json",
     "typecheck:offline": "tsc -p tsconfig.offline.json",
-    "test:offline": "ts-mocha -p tsconfig.offline.json -t 10000 \"tests/**/*.ts\" --ignore tests/onboarding-pool.ts"
+    "test:offline": "ts-mocha -p tsconfig.offline.json -t 10000 \"tests/**/*.ts\" --ignore tests/onboarding-pool.ts",
+    "test:money": "node -e \"if(!process.env.TEST_DATABASE_URL)throw new Error('TEST_DATABASE_URL is required; money ledger tests must not skip')\" && ts-mocha -p tsconfig.offline.json -t 30000 tests/money-ledger-pg.ts",
+    "money-import": "ts-node --project payments/tsconfig.json payments/src/funding/importLedger.ts"
   },
   "dependencies": {
     "@coral-xyz/anchor": "0.32.1",
     "@solana/spl-token": "^0.4.9",
-    "@solana/web3.js": "^1.98.4"
+    "@solana/web3.js": "^1.98.4",
+    "pg": "8.23.0"
   },
   "devDependencies": {
     "@solana/spl-token": "^0.4.9",
@@ -24,6 +27,7 @@
     "@types/chai": "^4.3.0",
     "@types/mocha": "^10.0.0",
     "@types/node": "^20.0.0",
+    "@types/pg": "8.23.1",
     "chai": "^4.3.4",
     "mocha": "^10.0.0",
     "ts-mocha": "^10.0.0",

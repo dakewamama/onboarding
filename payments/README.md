@@ -101,19 +101,23 @@ The same service also serves the additive USDC-funding routes (`/funding/*`) whe
 `SOLANA_USDC_MINT`, `SOLANA_COMMITMENT`, `FUNDING_CORS_ORIGINS` (the browser
 frontend's origin).
 
-The funding **deposit ledger is money** — it's what makes crediting idempotent on
-the tx signature and remembers deposits across restarts. It must survive redeploys,
-not just process restarts. The image defaults `FUNDING_STORE_DIR=/data` and marks
-`/data` a `VOLUME`, so:
+Balances, spends and deposits live in **Axis Money**, a double-entry ledger in
+Postgres (`payments/src/funding/moneyLedger.ts`). Set `DATABASE_URL`; the image runs
+with `NODE_ENV=production` and refuses to start without it. Every movement is an
+immutable, balanced transaction keyed by its identity (deposit signature, spend
+idempotency key), so retries and duplicate chain observations cannot post twice.
+Spends check and reserve the balance under a per-owner transaction lock, so
+concurrent requests from any number of instances cannot overdraw.
 
-1. In the Railway service, add a **Volume** with mount path **`/data`**.
-2. Leave `FUNDING_STORE_DIR` unset (image default `/data`), or set it to your mount
-   path if different.
+Migrating from the old file ledger: point `FUNDING_STORE_DIR` at the old store
+(the `/data` volume) and run `yarn money-import` once with `DATABASE_URL` set. It is
+idempotent, keeps each spend's original timestamp and state, and exits with code 2
+if any owner would be left negative.
 
-Without a mounted volume, `/data` is still just ephemeral container disk and a
-redeploy can lose or re-credit real deposits. Attach the volume before mainnet, or
-swap the file store for a DB (the atomic `wx`-per-signature contract maps directly
-to a `UNIQUE` constraint on the signature).
+The `/data` volume is still used for custodial wallet keys, custody-transfer
+records and the identity map, so keep it mounted.
+
+Validate the ledger against a disposable database: `TEST_DATABASE_URL=... yarn test:money`.
 
 ## Gotchas baked in (from v1 experience, verified against v2)
 

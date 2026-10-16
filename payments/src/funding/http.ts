@@ -96,14 +96,14 @@ export function mountFunding(): FundingMount {
       if (req.method === "GET" && url.pathname === "/funding/balance") {
         const owner = url.searchParams.get("owner");
         if (!owner) return void send(res, 400, { error: "owner is required" }), true;
-        send(res, 200, service.balance(owner));
+        send(res, 200, await service.balance(owner));
         return true;
       }
 
       if (req.method === "GET" && url.pathname === "/funding/deposits") {
         const owner = url.searchParams.get("owner");
         if (!owner) return void send(res, 400, { error: "owner is required" }), true;
-        send(res, 200, { owner, deposits: service.deposits(owner) });
+        send(res, 200, { owner, deposits: await service.deposits(owner) });
         return true;
       }
 

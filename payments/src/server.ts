@@ -15,6 +15,18 @@ import { mountFunding } from "./funding/http";
 import { mountOfframp } from "./offramp";
 import { mountAirtime } from "./airtime";
 import { mountCustodyTransfer } from "./custodyTransferHttp";
+import { openMoneyLedger, PostgresMoneyLedger } from "./funding/moneyLedger";
+import { fundingStoreDir } from "./funding/config";
+
+// Axis Money is configured before anything else. A missing production ledger
+// is fatal and must exit non-zero so the platform reports a failed deploy.
+let money: ReturnType<typeof openMoneyLedger>;
+try {
+  money = openMoneyLedger(process.env, fundingStoreDir(process.env));
+} catch (error) {
+  console.error("[money] ledger misconfigured; refusing to start:", (error as Error).message);
+  process.exit(1);
+}
 
 // Keep the receiver alive through background faults. The funding watcher polls an
 // external RPC that can rate-limit or blip; a stray rejection there must never
@@ -54,7 +66,6 @@ const offramp = mountOfframp(cfg);
 // INTERNAL_API_TOKEN). Shares funding's watch-armer so creating a user's wallet
 // also starts crediting its deposits.
 const airtime = mountAirtime(process.env, funding.armWatch);
-const custody = mountCustodyTransfer(process.env);
 const custodyTransfer = mountCustodyTransfer(process.env);
 
 async function handlePajWebhook(req: http.IncomingMessage, res: http.ServerResponse) {
@@ -86,12 +97,12 @@ const server = http.createServer(async (req, res) => {
   if (await custodyTransfer.handle(req, res)) return;
   if (await offramp.handle(req, res)) return; // /offramp* claimed it
   if (await airtime.handle(req, res)) return;
-  if (await custody.handle(req, res)) return; // /airtime claimed it
   if (await funding.handle(req, res)) return; // /funding/* claimed it
   res.writeHead(404).end();
 });
 
-server.listen(PORT, () => {
+const moneyReady = money instanceof PostgresMoneyLedger ? money.migrate() : Promise.resolve();
+moneyReady.then(() => server.listen(PORT, () => {
   console.log(
     `Paj webhook receiver on http://localhost:${PORT}/webhooks/paj (env=${cfg.env}, mode=${cfg.mode})`
   );
@@ -99,7 +110,10 @@ server.listen(PORT, () => {
   custodyTransfer.logStatus(PORT);
   offramp.logStatus(PORT);
   airtime.logStatus(PORT);
-  custody.logStatus(PORT);
+  console.log(`[money] ledger ${money instanceof PostgresMoneyLedger ? "postgres" : "file (development only)"}`);
+}), error => {
+  console.error("[money] ledger unavailable; refusing to start", error);
+  process.exit(1);
 });
 
 // Graceful shutdown: Railway sends SIGTERM to the old container on every redeploy.
@@ -107,7 +121,7 @@ server.listen(PORT, () => {
 // false alarm. Force-exit if something (e.g. the deposit watcher interval) hangs.
 function shutdown(signal: string): void {
   console.log(`[server] ${signal} received; shutting down cleanly`);
-  server.close(() => process.exit(0));
+  server.close(() => void money.close().finally(() => process.exit(0)));
   setTimeout(() => process.exit(0), 5000).unref();
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));

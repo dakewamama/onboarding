@@ -23,11 +23,10 @@ function deps(
   return {
     getRate: async () => RATE,
     marginBps: 0,
-    availableBaseUnits: () => available - spends.spentBaseUnits("w"),
-    spend: (input, avail) => spends.spend(input, avail),
-    getSpend: (owner, key) => spends.get(owner, key),
-    findSpend: key => spends.findByKey(key),
-    setState: (owner, key, state) => spends.setState(owner, key, state),
+    spend: async input => spends.spend(input, available - spends.spentBaseUnits("w")),
+    getSpend: async (owner, key) => spends.get(owner, key),
+    findSpend: async key => spends.findByKey(key),
+    setState: async (owner, key, state) => spends.setState(owner, key, state),
     requery: async requestId => ({ ...pending, requestId }),
     buyAirtime,
   };

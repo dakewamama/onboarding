@@ -1,17 +1,17 @@
 import { createHash } from "crypto";
 import type { AirtimeResult } from "./vtpassClient";
 import { requestIdForKey } from "./vtpassClient";
-import type { SpendLedger, SpendRecord, SpendState } from "./funding/spendLedger";
+import type { SpendRecord, SpendState } from "./funding/spendLedger";
+import type { MoneyLedger } from "./funding/moneyLedger";
 import { ngnToUsdcBase } from "./rate";
 
 export interface AirtimeFulfillDeps {
   getRate: () => Promise<number>;
   marginBps: number;
-  availableBaseUnits: (owner: string) => bigint;
-  spend: SpendLedger["spend"];
-  getSpend: SpendLedger["get"];
-  findSpend: SpendLedger["findByKey"];
-  setState: SpendLedger["setState"];
+  spend: MoneyLedger["spend"];
+  getSpend: MoneyLedger["get"];
+  findSpend: MoneyLedger["findByKey"];
+  setState: MoneyLedger["setState"];
   buyAirtime: (p: { network: string; amount: number; phone: string; requestId: string }) => Promise<AirtimeResult>;
   requery: (requestId: string) => Promise<AirtimeResult>;
 }
@@ -53,7 +53,7 @@ function result(record: SpendRecord): AirtimeFulfillResult {
   };
 }
 
-function apply(deps: AirtimeFulfillDeps, record: SpendRecord, delivery: AirtimeResult): AirtimeFulfillResult {
+async function apply(deps: AirtimeFulfillDeps, record: SpendRecord, delivery: AirtimeResult): Promise<AirtimeFulfillResult> {
   let state: SpendState = "IN_DOUBT";
   // Unknown/malformed/duplicate codes are not proof of failure or success.
   const correlated = !delivery.requestId || delivery.requestId === providerId(record);
@@ -63,7 +63,7 @@ function apply(deps: AirtimeFulfillDeps, record: SpendRecord, delivery: AirtimeR
     else if (delivery.status === "reversed" && delivery.code === "040") state = "REVERSED";
     else if (["pending", "initiated"].includes(delivery.status)) state = "PENDING";
   }
-  return result(deps.setState(record.owner, record.idempotencyKey, state));
+  return result(await deps.setState(record.owner, record.idempotencyKey, state));
 }
 
 /** Reserve once, persist the action timestamp before /pay, and never replay /pay.
@@ -77,31 +77,31 @@ export async function fulfillAirtime(deps: AirtimeFulfillDeps, params: AirtimeFu
     }
     return result(record);
   };
-  const existing = deps.getSpend(params.owner, params.idempotencyKey);
+  const existing = await deps.getSpend(params.owner, params.idempotencyKey);
   if (existing) return replay(existing); // works even when rate/balance/provider are down
   const rate = await deps.getRate();
   const cost = ngnToUsdcBase(params.amount, rate);
   const paid = ngnToUsdcBase(params.amount * (1 + deps.marginBps / 10000), rate);
-  const reserved = deps.spend({
+  const reserved = await deps.spend({
     owner: params.owner, idempotencyKey: params.idempotencyKey,
     paidBaseUnits: paid, costBaseUnits: cost,
     reason: `airtime ${params.network} ${params.phone}`,
     provider: "vtpass", requestFingerprint: fingerprint,
-  }, deps.availableBaseUnits(params.owner));
+  });
   if (reserved.duplicate) return replay(reserved.record);
   const requestId = providerId(reserved.record)!;
   let delivery: AirtimeResult;
   try {
     delivery = await deps.buyAirtime({ network: params.network, amount: params.amount, phone: params.phone, requestId });
   } catch {
-    return result(deps.getSpend(params.owner, params.idempotencyKey)!); // initial IN_DOUBT debit stands
+    return result((await deps.getSpend(params.owner, params.idempotencyKey))!); // initial IN_DOUBT debit stands
   }
   return apply(deps, reserved.record, delivery);
 }
 
 /** The service-token gate is at the HTTP boundary. No requery can create a debit. */
 export async function requeryAirtime(deps: AirtimeFulfillDeps, key: string): Promise<AirtimeFulfillResult | null> {
-  const record = deps.findSpend(key);
+  const record = await deps.findSpend(key);
   if (!record) return null;
   if (["SETTLED", "RELEASED", "REVERSED"].includes(record.state ?? "")) return result(record);
   const requestId = providerId(record);
@@ -110,8 +110,8 @@ export async function requeryAirtime(deps: AirtimeFulfillDeps, key: string): Pro
   try {
     delivery = await deps.requery(requestId);
   } catch {
-    return result(deps.setState(record.owner, key, "IN_DOUBT"));
+    return result(await deps.setState(record.owner, key, "IN_DOUBT"));
   }
-  if (delivery.requestId !== requestId) return result(deps.setState(record.owner, key, "IN_DOUBT"));
+  if (delivery.requestId !== requestId) return result(await deps.setState(record.owner, key, "IN_DOUBT"));
   return apply(deps, record, delivery);
 }

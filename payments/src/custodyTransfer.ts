@@ -9,12 +9,11 @@ import {
 } from "@solana/spl-token";
 import { walletAddressFor, withUserKeypair } from "./custody";
 import { fundingStoreDir, loadFundingConfig } from "./funding/config";
-import { DepositLedger } from "./funding/depositLedger";
 import {
   InsufficientBalanceError,
-  SpendLedger,
   type SpendState,
 } from "./funding/spendLedger";
+import { openMoneyLedger, type MoneyLedger } from "./funding/moneyLedger";
 
 export type CustodyTransferStatus =
   | "pending"
@@ -88,6 +87,7 @@ export interface CustodyTransferDeps {
     env?: NodeJS.ProcessEnv,
   ) => Promise<T>;
   env?: NodeJS.ProcessEnv;
+  ledger?: MoneyLedger;
 }
 
 export class CustodyTransferConflict extends Error {}
@@ -258,40 +258,31 @@ function loadOperator(env: NodeJS.ProcessEnv): Keypair {
 export class CustodyTransferService {
   private walletLookup: (storeDir: string, userId: string) => string | null;
   private signer: NonNullable<CustodyTransferDeps["withUserKeypair"]>;
-  private deposits: DepositLedger;
-  private spends: SpendLedger;
+  private ledger: MoneyLedger;
   private env: NodeJS.ProcessEnv;
 
   constructor(private deps: CustodyTransferDeps) {
     this.walletLookup = deps.walletAddressFor ?? walletAddressFor;
     this.signer = deps.withUserKeypair ?? withUserKeypair;
-    this.deposits = new DepositLedger(deps.storeDir);
-    this.spends = new SpendLedger(deps.storeDir);
     this.env = deps.env ?? process.env;
+    this.ledger = deps.ledger ?? openMoneyLedger(this.env, deps.storeDir);
   }
 
-  private spendable(ledgerOwner: string): bigint {
-    return (
-      this.deposits.balanceBaseUnits(ledgerOwner) -
-      this.spends.spentBaseUnits(ledgerOwner)
-    );
-  }
-
-  private setSpendState(
+  private async setSpendState(
     ledgerOwner: string,
     key: string,
     state: SpendState,
-  ): void {
-    this.spends.setState(ledgerOwner, key, state);
+  ): Promise<void> {
+    await this.ledger.setState(ledgerOwner, key, state);
   }
 
-  private reserve(
+  private async reserve(
     ledgerOwner: string,
     input: CustodyTransferInput,
     amount: bigint,
     digest: string,
-  ): void {
-    const existing = this.spends.get(ledgerOwner, input.idempotencyKey);
+  ): Promise<void> {
+    const existing = await this.ledger.get(ledgerOwner, input.idempotencyKey);
 
     if (existing) {
       if (existing.requestFingerprint !== digest) {
@@ -302,7 +293,7 @@ export class CustodyTransferService {
       return;
     }
 
-    const reserved = this.spends.spend(
+    const reserved = await this.ledger.spend(
       {
         owner: ledgerOwner,
         idempotencyKey: input.idempotencyKey,
@@ -311,7 +302,6 @@ export class CustodyTransferService {
         reason: "merchant custody transfer",
         requestFingerprint: digest,
       },
-      this.spendable(ledgerOwner),
     );
 
     if (reserved.record.requestFingerprint !== digest) {
@@ -320,7 +310,7 @@ export class CustodyTransferService {
       );
     }
 
-    this.spends.setState(ledgerOwner, input.idempotencyKey, "IN_DOUBT");
+    await this.ledger.setState(ledgerOwner, input.idempotencyKey, "IN_DOUBT");
   }
 
   async transfer(
@@ -383,10 +373,8 @@ export class CustodyTransferService {
     if (!claimed.inserted) return this.reconcile(claimed.record);
 
     try {
-      // These two operations are synchronous and adjacent. In the current
-      // single-writer payments process there is no await between balance
-      // calculation and the durable spend record.
-      this.reserve(ownerAddress, input, amount, digest);
+      // Axis Money checks the balance and records the debit atomically.
+      await this.reserve(ownerAddress, input, amount, digest);
     } catch (error) {
       const failed: StoredTransfer = {
         ...claimed.record,
@@ -482,7 +470,7 @@ export class CustodyTransferService {
               updatedAt: new Date().toISOString(),
             };
             writeTransfer(this.deps.storeDir, current);
-            this.setSpendState(
+            await this.setSpendState(
               ownerAddress,
               input.idempotencyKey,
               "IN_DOUBT",
@@ -498,7 +486,7 @@ export class CustodyTransferService {
               updatedAt: new Date().toISOString(),
             };
             writeTransfer(this.deps.storeDir, current);
-            this.setSpendState(
+            await this.setSpendState(
               ownerAddress,
               input.idempotencyKey,
               "IN_DOUBT",
@@ -513,7 +501,7 @@ export class CustodyTransferService {
             updatedAt: new Date().toISOString(),
           };
           writeTransfer(this.deps.storeDir, current);
-          this.setSpendState(
+          await this.setSpendState(
             ownerAddress,
             input.idempotencyKey,
             "PENDING",
@@ -523,13 +511,13 @@ export class CustodyTransferService {
       );
     } catch (error) {
       if (!current.signature) {
-        this.setSpendState(
+        await this.setSpendState(
           ownerAddress,
           input.idempotencyKey,
           "RELEASED",
         );
       } else {
-        this.setSpendState(
+        await this.setSpendState(
           ownerAddress,
           input.idempotencyKey,
           "IN_DOUBT",
@@ -562,7 +550,7 @@ export class CustodyTransferService {
     if (!record.signature) {
       if (record.status === "failed") return result(record);
 
-      const debit = this.spends.get(
+      const debit = await this.ledger.get(
         record.ledgerOwner,
         record.idempotencyKey,
       );
@@ -578,7 +566,7 @@ export class CustodyTransferService {
         return result(failed);
       }
 
-      this.setSpendState(
+      await this.setSpendState(
         record.ledgerOwner,
         record.idempotencyKey,
         "IN_DOUBT",
@@ -606,7 +594,7 @@ export class CustodyTransferService {
         )
       ).value[0];
     } catch (error) {
-      this.setSpendState(
+      await this.setSpendState(
         record.ledgerOwner,
         record.idempotencyKey,
         "IN_DOUBT",
@@ -623,7 +611,7 @@ export class CustodyTransferService {
     }
 
     if (!chainStatus) {
-      this.setSpendState(
+      await this.setSpendState(
         record.ledgerOwner,
         record.idempotencyKey,
         "IN_DOUBT",
@@ -639,7 +627,7 @@ export class CustodyTransferService {
     }
 
     if (chainStatus.confirmationStatus !== "finalized") {
-      this.setSpendState(
+      await this.setSpendState(
         record.ledgerOwner,
         record.idempotencyKey,
         "PENDING",
@@ -655,7 +643,7 @@ export class CustodyTransferService {
     }
 
     if (chainStatus.err) {
-      this.setSpendState(
+      await this.setSpendState(
         record.ledgerOwner,
         record.idempotencyKey,
         "REVERSED",
@@ -670,7 +658,7 @@ export class CustodyTransferService {
       return result(next);
     }
 
-    this.setSpendState(
+    await this.setSpendState(
       record.ledgerOwner,
       record.idempotencyKey,
       "SETTLED",

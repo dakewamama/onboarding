@@ -2,7 +2,8 @@ import * as fs from "fs";
 import * as path from "path";
 import { Connection, PublicKey, ParsedTransactionWithMeta } from "@solana/web3.js";
 import { FundingConfig } from "./config";
-import { DepositLedger, CreditRecord } from "./depositLedger";
+import type { CreditRecord } from "./depositLedger";
+import type { MoneyLedger } from "./moneyLedger";
 import { solUsdcPrice } from "./solPrice";
 
 const LAMPORTS_PER_SOL = 1_000_000_000;
@@ -31,7 +32,7 @@ export class SolWatcher {
 
   constructor(
     private cfg: FundingConfig,
-    private ledger: DepositLedger,
+    private ledger: Pick<MoneyLedger, "credit" | "hasCredited">,
     private onCredit: (r: CreditRecord) => void | Promise<void> = () => {},
     connection?: Connection,
   ) {
@@ -92,7 +93,7 @@ export class SolWatcher {
       if (info.err) continue;
       if (!this.meetsCommitment(info.confirmationStatus)) continue;
       const key = `${info.signature}:sol`;
-      if (this.ledger.hasCredited(owner, key)) continue;
+      if (await this.ledger.hasCredited(owner, key)) continue;
 
       const tx = await this.connection.getParsedTransaction(info.signature, {
         commitment: this.cfg.commitment,
@@ -118,7 +119,7 @@ export class SolWatcher {
       const baseUnits = this.toUsdcBase(lamports, price);
       if (baseUnits <= BigInt(0)) continue;
 
-      const fresh = this.ledger.credit({
+      const fresh = await this.ledger.credit({
         signature: key,
         owner,
         baseUnits: baseUnits.toString(),

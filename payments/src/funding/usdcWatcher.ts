@@ -8,7 +8,8 @@ import {
 } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { FundingConfig } from "./config";
-import { DepositLedger, CreditRecord } from "./depositLedger";
+import type { CreditRecord } from "./depositLedger";
+import type { MoneyLedger } from "./moneyLedger";
 
 /**
  * Watches the chain for USDC arriving at each user's Axis wallet and credits the
@@ -36,7 +37,7 @@ export class UsdcWatcher {
 
   constructor(
     private cfg: FundingConfig,
-    private ledger: DepositLedger,
+    private ledger: Pick<MoneyLedger, "credit" | "hasCredited">,
     private onCredit: (r: CreditRecord) => void | Promise<void> = () => {},
     connection?: Connection
   ) {
@@ -111,7 +112,7 @@ export class UsdcWatcher {
     for (const info of sigs) {
       if (info.err) continue; // failed tx moved no funds
       if (!this.meetsCommitment(info.confirmationStatus)) continue; // not yet confirmed enough
-      if (this.ledger.hasCredited(owner, info.signature)) continue; // already credited
+      if (await this.ledger.hasCredited(owner, info.signature)) continue; // already credited
 
       const tx = await this.connection.getParsedTransaction(info.signature, {
         commitment: this.cfg.commitment,
@@ -122,7 +123,7 @@ export class UsdcWatcher {
       const baseUnits = this.incomingBaseUnits(tx, owner);
       if (baseUnits <= BigInt(0)) continue; // not an incoming USDC transfer
 
-      const fresh = this.ledger.credit({
+      const fresh = await this.ledger.credit({
         signature: info.signature,
         owner,
         baseUnits: baseUnits.toString(),
