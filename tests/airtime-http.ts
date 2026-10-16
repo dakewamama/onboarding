@@ -77,11 +77,30 @@ describe("airtime HTTP ambiguity boundary", () => {
     assert.equal(purchases, 1);
   });
 
-  it("status is authenticated, and unknown action keys do not imply provider failure", async () => {
+  it("status is authenticated; an unknown key is voided so a late purchase cannot debit", async () => {
     assert.equal((await status("wrong-token")).status, 401);
-    const response = await status("test-token", "missing");
-    assert.equal(response.status, 202);
-    assert.equal((await response.json() as { status: string }).status, "in_doubt");
+    const response = await status("test-token", "axis-case");
+    assert.equal(response.status, 200);
+    assert.deepInclude(await response.json() as object, { status: "failed", moneyState: "RELEASED", reason: "not_submitted" });
+    const late = await buy();
+    assert.equal(late.status, 409);
+    assert.deepInclude(await late.json() as object, { status: "failed", moneyState: "RELEASED", reason: "voided" });
     assert.equal(purchases, 0);
+    assert.equal(new SpendLedger(dir).records("wallet").length, 0);
+  });
+
+  it("a purchase refused before any debit is definitive and voids its key", async () => {
+    const refused = await realFetch(`${base}/airtime`, { method: "POST", headers: { authorization: "Bearer test-token", "content-type": "application/json" }, body: JSON.stringify({ ...body, owner: "unlinked" }) });
+    assert.equal(refused.status, 409);
+    assert.deepInclude(await refused.json() as object, { status: "failed", moneyState: "RELEASED", reason: "no_wallet" });
+    assert.equal((await buy()).status, 409);
+    assert.equal(purchases, 0);
+  });
+
+  it("a purchase that already debited is never reported as not debited", async () => {
+    await buy();
+    const again = await status();
+    assert.notEqual((await again.json() as { reason?: string }).reason, "not_submitted");
+    assert.equal(purchases, 1);
   });
 });

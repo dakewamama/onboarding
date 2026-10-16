@@ -3,7 +3,7 @@ import { URL } from "url";
 import { timingSafeEqual } from "crypto";
 import { VtpassClient, VtpassEnv, serviceIdFor } from "./vtpassClient";
 import { InsufficientBalanceError } from "./funding/spendLedger";
-import { openMoneyLedger } from "./funding/moneyLedger";
+import { openMoneyLedger, SpendKeyVoidedError } from "./funding/moneyLedger";
 import { fundingStoreDir } from "./funding/config";
 import { usdcToNgnRate, offRampNgnPerUsdc } from "./rate";
 import { fulfillAirtime, requeryAirtime, AirtimeIdentityConflict, AirtimeFulfillDeps } from "./airtimeFulfill";
@@ -89,6 +89,7 @@ export function mountAirtime(
     spend: input => ledger.spend(input),
     getSpend: (owner, key) => ledger.get(owner, key),
     findSpend: key => ledger.findByKey(key),
+    voidUnknownKey: (key, reason) => ledger.voidUnknownKey(key, reason),
     setState: (owner, key, state) => ledger.setState(owner, key, state),
     requery: requestId => client!.requery(requestId),
     buyAirtime: (p) => client!.buyAirtime(p),
@@ -123,6 +124,7 @@ export function mountAirtime(
       try {
         const verdict = await requeryAirtime(deps, key);
         if (!verdict) return void send(res, 202, { status: "in_doubt", moneyState: "IN_DOUBT" }), true;
+        if (verdict.status === "failed" && verdict.reason === "not_submitted") return void send(res, 200, verdict), true;
         return void send(res, verdict.status === "in_doubt" || verdict.status === "pending" ? 202 : 200, verdict), true;
       } catch {
         return void send(res, 202, { status: "in_doubt", moneyState: "IN_DOUBT" }), true;
@@ -163,6 +165,7 @@ export function mountAirtime(
 
     if (req.method !== "POST") return void send(res, 405, { error: "method" }), true;
 
+    let buyKey = "";
     try {
       let body: Record<string, unknown>;
       try {
@@ -205,20 +208,16 @@ export function mountAirtime(
       }
 
       // From here on it's the buy route, which needs VTpass + rate configured.
-      if (!enabled) return void send(res, 503, { error: disabledReason }), true;
       const rawOwner = String(body.owner ?? "");
       const network = String(body.network ?? "");
       const phone = String(body.phone ?? "");
       const idempotencyKey = String(body.idempotencyKey ?? "");
+      buyKey = idempotencyKey;
+      if (!enabled) return void (await rejectBeforeDebit(res, idempotencyKey, 503, "not_debited", disabledReason)), true;
       const amount = body.amount != null ? Number(body.amount) : NaN;
       if (!rawOwner || !network || !phone || !idempotencyKey || !Number.isFinite(amount) || !(amount > 0) || !serviceIdFor(network)) {
-        return (
-          void send(res, 400, {
-            error:
-              "owner, network, phone, idempotencyKey and a positive amount are required",
-          }),
-          true
-        );
+        return void (await rejectBeforeDebit(res, idempotencyKey, 400, "invalid_request",
+          "owner, network, phone, idempotencyKey and a positive amount are required")), true;
       }
       // Resolve to the single money key: the custodial wallet address deposits are
       // credited under. rawOwner is normally a userId; accept a linked address too.
@@ -229,12 +228,8 @@ export function mountAirtime(
       } else if (identity.userFor(rawOwner)) {
         owner = rawOwner; // rawOwner was already the linked address
       } else {
-        return (
-          void send(res, 409, {
-            error: "no wallet linked for this user; call /airtime/link first",
-          }),
-          true
-        );
+        return void (await rejectBeforeDebit(res, idempotencyKey, 409, "no_wallet",
+          "no wallet linked for this user; call /airtime/link first")), true;
       }
       const result = await fulfillAirtime(deps, {
         owner,
@@ -253,12 +248,32 @@ export function mountAirtime(
     } catch (err) {
       if (err instanceof AirtimeIdentityConflict) return void send(res, 409, { error: err.message }), true;
       if (err instanceof InsufficientBalanceError) {
-        return void send(res, 402, { error: "insufficient balance" }), true;
+        return void send(res, 402, { error: "insufficient balance", status: "failed", moneyState: "RELEASED", reason: "insufficient_balance" }), true;
+      }
+      if (err instanceof SpendKeyVoidedError) {
+        return void send(res, 409, { status: "failed", moneyState: "RELEASED", reason: "voided" }), true;
       }
       // Never leak the key; surface a generic error.
       console.error("[airtime] error", (err as Error).message);
+      if (buyKey) {
+        try { return void (await rejectBeforeDebit(res, buyKey, 503, "not_debited", "airtime unavailable")), true; }
+        catch { /* the ledger itself is unreachable: the outcome stays unknown */ }
+      }
       return void send(res, 202, { status: "in_doubt", moneyState: "IN_DOUBT" }), true;
     }
+  }
+
+  /**
+   * A purchase refused before any debit. Void the key so no later request can
+   * debit under it, then answer definitively. If a debit somehow exists, report it.
+   */
+  async function rejectBeforeDebit(res: http.ServerResponse, key: string, code: number, reason: string, error: string): Promise<void> {
+    const existing = key ? await ledger.voidUnknownKey(key, reason) : null;
+    if (existing) {
+      const verdict = await requeryAirtime(deps, key);
+      return send(res, verdict && verdict.status !== "in_doubt" && verdict.status !== "pending" ? 200 : 202, verdict ?? { status: "in_doubt", moneyState: "IN_DOUBT" });
+    }
+    send(res, code, { error, status: "failed", moneyState: "RELEASED", reason });
   }
 
   function logStatus(_port: number): void {

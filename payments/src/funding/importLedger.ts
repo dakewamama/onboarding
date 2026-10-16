@@ -1,6 +1,7 @@
 import { Pool } from "pg";
 import { fundingStoreDir } from "./config";
 import { PostgresMoneyLedger } from "./moneyLedger";
+import { importTransferFiles } from "./transferStore";
 
 /** Copy the legacy JSON-file ledger into Axis Money. Safe to re-run. */
 async function main(): Promise<void> {
@@ -10,7 +11,8 @@ async function main(): Promise<void> {
   const ledger = new PostgresMoneyLedger(new Pool({ connectionString: url }));
   try {
     const report = await ledger.importFileLedger(dir);
-    console.log(JSON.stringify({ dir, ...report }));
+    const transfers = await importTransferFiles(ledger, dir);
+    console.log(JSON.stringify({ dir, ...report, transfers }));
     if (report.negativeOwners.length) process.exitCode = 2;
   } finally {
     await ledger.close();

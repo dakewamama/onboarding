@@ -4,7 +4,8 @@ import { Pool } from "pg";
 import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
-import { FileMoneyLedger, PostgresMoneyLedger } from "../payments/src/funding/moneyLedger";
+import { FileMoneyLedger, PostgresMoneyLedger, SpendKeyVoidedError } from "../payments/src/funding/moneyLedger";
+import { PostgresTransferStore, importTransferFiles } from "../payments/src/funding/transferStore";
 import { InsufficientBalanceError } from "../payments/src/funding/spendLedger";
 
 const url = process.env.TEST_DATABASE_URL;
@@ -141,6 +142,49 @@ describe("Axis Money Postgres ledger", function () {
       assert.equal(after.at, before.at, key);
       assert.equal(after.state, before.state, key);
     }
+  });
+
+  it("voiding an unknown key and a debit under it race to exactly one winner", async () => {
+    await credit(a, "void", "sig", 1000);
+    for (let i = 0; i < 20; i++) {
+      const key = `race-${i}`;
+      const [spent, voided] = await Promise.allSettled([
+        a.spend({ owner: "void", idempotencyKey: key, paidBaseUnits: u(1), costBaseUnits: u(1), reason: "t" }),
+        b.voidUnknownKey(key, "not_submitted"),
+      ]);
+      const debited = spent.status === "fulfilled";
+      if (!debited) assert.instanceOf((spent as PromiseRejectedResult).reason, SpendKeyVoidedError);
+      // A void that lost the race must report the debit it found, never "not submitted".
+      assert.equal(voided.status === "fulfilled" && voided.value !== null, debited, key);
+    }
+    const spends = await a.pool.query("SELECT count(*)::int AS n FROM money_spends WHERE owner='void'");
+    const voids = await a.pool.query("SELECT count(*)::int AS n FROM money_voided_keys WHERE idempotency_key LIKE 'race-%'");
+    assert.equal(spends.rows[0].n + voids.rows[0].n, 20);
+  });
+
+  it("custody transfer records claim once and compare-and-set across processes", async () => {
+    type R = { idempotencyKey: string; status: string; signature?: string; updatedAt: string };
+    const one = new PostgresTransferStore<R>(a), two = new PostgresTransferStore<R>(b);
+    const base: R = { idempotencyKey: "t1", status: "in_doubt", updatedAt: new Date().toISOString() };
+    const claims = await Promise.all([one.claim(base), two.claim(base)]);
+    assert.equal(claims.filter(c => c.inserted).length, 1);
+    const unsigned = (r: R) => !r.signature && r.status !== "failed";
+    const [signed, abandoned] = await Promise.all([
+      one.update({ ...base, signature: "sig" }, unsigned),
+      two.update({ ...base, status: "failed" }, unsigned),
+    ]);
+    assert.notEqual(signed, abandoned, "exactly one writer wins");
+    const stored = (await one.read("t1"))!;
+    assert.equal(stored.signature === "sig", signed);
+  });
+
+  it("imports legacy custody transfer files once", async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "transfer-import-"));
+    fs.mkdirSync(path.join(dir, "custody-transfers"));
+    fs.writeFileSync(path.join(dir, "custody-transfers", "x.json"), JSON.stringify({ idempotencyKey: "legacy-t", status: "settled", signature: "s", updatedAt: "2026-01-01T00:00:00.000Z" }));
+    assert.equal(await importTransferFiles(a, dir), 1);
+    assert.equal(await importTransferFiles(b, dir), 0);
+    assert.equal((await new PostgresTransferStore(a).read("legacy-t"))?.status, "settled");
   });
 
   it("ambiguous keys across owners fail closed", async () => {

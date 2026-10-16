@@ -114,8 +114,30 @@ Migrating from the old file ledger: point `FUNDING_STORE_DIR` at the old store
 idempotent, keeps each spend's original timestamp and state, and exits with code 2
 if any owner would be left negative.
 
-The `/data` volume is still used for custodial wallet keys, custody-transfer
-records and the identity map, so keep it mounted.
+Custody-transfer records live in Postgres too (`custody_transfers`), and every
+update after the first claim is a compare-and-set, so a status reconcile and an
+in-progress transfer can never both win. `yarn money-import` copies existing
+transfer files as well. The `/data` volume is still used for custodial wallet
+keys and the identity map, so keep it mounted.
+
+### Definitive failures (no money moved)
+
+Responses carry `moneyState`. `status:"failed"` with `moneyState:"RELEASED"` means
+nothing left the user's balance, and comes with a `reason`:
+
+- `not_debited` / `invalid_request` / `no_wallet` / `insufficient_balance`: the
+  request was refused before any debit.
+- `not_submitted`: a status check for a key this service never saw. The key is
+  voided first, so a late request carrying it is refused (`409`, `voided`) and can
+  never debit.
+- `not_broadcast`: a custody transfer claimed but never signed (for example, a
+  crash) and abandoned after two minutes. Its signature can no longer be stored,
+  so it can never be broadcast afterwards.
+- `expired`: the finalized chain passed the transaction's last valid block height
+  and its signature is unknown, so it can never land.
+
+`failed` + `REVERSED` means the transaction landed with an error. Anything else
+uncertain stays `IN_DOUBT` and is reconciled under its original identity.
 
 Validate the ledger against a disposable database: `TEST_DATABASE_URL=... yarn test:money`.
 

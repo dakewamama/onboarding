@@ -26,6 +26,7 @@ function deps(
     spend: async input => spends.spend(input, available - spends.spentBaseUnits("w")),
     getSpend: async (owner, key) => spends.get(owner, key),
     findSpend: async key => spends.findByKey(key),
+    voidUnknownKey: async key => spends.findByKey(key),
     setState: async (owner, key, state) => spends.setState(owner, key, state),
     requery: async requestId => ({ ...pending, requestId }),
     buyAirtime,

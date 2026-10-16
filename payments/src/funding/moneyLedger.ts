@@ -1,5 +1,6 @@
 import * as fs from "fs";
 import * as path from "path";
+import { createHash } from "crypto";
 import { Pool, type PoolClient } from "pg";
 import type { CreditRecord } from "./depositLedger";
 import { DepositLedger } from "./depositLedger";
@@ -52,6 +53,11 @@ export interface MoneyLedger {
   get(owner: string, key: string): Promise<SpendRecord | null>;
   /** Service-authenticated lookup; ambiguous cross-owner keys fail closed. */
   findByKey(key: string): Promise<SpendRecord | null>;
+  /**
+   * For a status check on a key with no spend: void the key so a late request
+   * carrying it can never debit, and return null. Returns the spend if one exists.
+   */
+  voidUnknownKey(key: string, reason: string): Promise<SpendRecord | null>;
   /** Terminal states (SETTLED, RELEASED, REVERSED) never change. */
   setState(owner: string, key: string, state: SpendState): Promise<SpendRecord>;
   spentBaseUnits(owner: string): Promise<bigint>;
@@ -59,12 +65,16 @@ export interface MoneyLedger {
   close(): Promise<void>;
 }
 
+export class SpendKeyVoidedError extends Error {
+  constructor(readonly key: string) { super(`idempotency key ${key} was voided before any debit`); this.name = "SpendKeyVoidedError"; }
+}
+
 const TERMINAL: readonly (SpendState | undefined)[] = ["SETTLED", "RELEASED", "REVERSED"];
 
 export class FileMoneyLedger implements MoneyLedger {
   readonly depositsLedger: DepositLedger;
   readonly spendsLedger: SpendLedger;
-  constructor(dir: string) {
+  constructor(private dir: string) {
     this.depositsLedger = new DepositLedger(dir);
     this.spendsLedger = new SpendLedger(dir);
   }
@@ -74,8 +84,18 @@ export class FileMoneyLedger implements MoneyLedger {
   async availableBaseUnits(owner: string) {
     return this.depositsLedger.balanceBaseUnits(owner) - this.spendsLedger.spentBaseUnits(owner);
   }
+  private voidedFile(key: string) { return path.join(this.dir, "voided", `${createHash("sha256").update(key).digest("hex")}.json`); }
+  async voidUnknownKey(key: string, reason: string) {
+    const existing = this.spendsLedger.findByKey(key);
+    if (existing) return existing;
+    fs.mkdirSync(path.join(this.dir, "voided"), { recursive: true });
+    try { fs.writeFileSync(this.voidedFile(key), JSON.stringify({ key, reason, at: new Date().toISOString() }), { flag: "wx" }); }
+    catch (error) { if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error; }
+    return null;
+  }
   // Check and write are adjacent and synchronous, so this is safe only within one process.
   async spend(input: SpendInput) {
+    if (!this.spendsLedger.get(input.owner, input.idempotencyKey) && fs.existsSync(this.voidedFile(input.idempotencyKey))) throw new SpendKeyVoidedError(input.idempotencyKey);
     return this.spendsLedger.spend(input, this.depositsLedger.balanceBaseUnits(input.owner) - this.spendsLedger.spentBaseUnits(input.owner));
   }
   async get(owner: string, key: string) { return this.spendsLedger.get(owner, key); }
@@ -126,6 +146,16 @@ CREATE TABLE IF NOT EXISTS money_spends (
   PRIMARY KEY (owner, idempotency_key)
 );
 CREATE INDEX IF NOT EXISTS money_spends_key ON money_spends (idempotency_key);
+CREATE TABLE IF NOT EXISTS money_voided_keys (
+  idempotency_key text PRIMARY KEY,
+  reason text NOT NULL,
+  at timestamptz NOT NULL DEFAULT now()
+);
+CREATE TABLE IF NOT EXISTS custody_transfers (
+  idempotency_key text PRIMARY KEY,
+  record jsonb NOT NULL,
+  updated_at timestamptz NOT NULL DEFAULT now()
+);
 CREATE OR REPLACE FUNCTION money_immutable() RETURNS trigger LANGUAGE plpgsql AS $$
 BEGIN RAISE EXCEPTION 'money ledger entries are immutable'; END $$;
 DROP TRIGGER IF EXISTS money_transactions_immutable ON money_transactions;
@@ -190,6 +220,22 @@ export class PostgresMoneyLedger implements MoneyLedger {
     await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`axis-money:${owner}`]);
   }
 
+  private async lockKey(db: PoolClient, key: string): Promise<void> {
+    await db.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [`axis-money-key:${key}`]);
+  }
+
+  async voidUnknownKey(key: string, reason: string): Promise<SpendRecord | null> {
+    await this.migrate();
+    return this.tx(async db => {
+      await this.lockKey(db, key);
+      const r = await db.query("SELECT * FROM money_spends WHERE idempotency_key=$1 LIMIT 2", [key]);
+      if (r.rows.length > 1) throw new Error("ambiguous action key");
+      if (r.rows[0]) return toSpend(r.rows[0]);
+      await db.query("INSERT INTO money_voided_keys(idempotency_key,reason) VALUES ($1,$2) ON CONFLICT DO NOTHING", [key, reason]);
+      return null;
+    });
+  }
+
   private async balance(db: Pool | PoolClient, account: string): Promise<bigint> {
     const r = await db.query("SELECT COALESCE(SUM(amount),0)::text AS v FROM money_postings WHERE account=$1 AND asset=$2", [account, ASSET]);
     return BigInt(r.rows[0].v);
@@ -240,8 +286,10 @@ export class PostgresMoneyLedger implements MoneyLedger {
     await this.migrate();
     return this.tx(async db => {
       await this.lockOwner(db, owner);
+      await this.lockKey(db, idempotencyKey);
       const existing = await this.row(db, owner, idempotencyKey);
       if (existing) return { applied: false, duplicate: true, record: existing };
+      if ((await db.query("SELECT 1 FROM money_voided_keys WHERE idempotency_key=$1", [idempotencyKey])).rowCount) throw new SpendKeyVoidedError(idempotencyKey);
       const free = await this.balance(db, available(owner));
       if (paidBaseUnits > free) throw new InsufficientBalanceError(owner, paidBaseUnits, free);
       const at = new Date().toISOString();

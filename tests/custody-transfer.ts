@@ -49,12 +49,19 @@ class FakeChain {
   sent = 0;
   throwOnSend = false;
   verdict: "none" | "confirmed" | "finalized" | "failed" = "none";
+  height = 100;
+  blockGate: Promise<void> = Promise.resolve();
 
   async getLatestBlockhash() {
+    await this.blockGate;
     return {
       blockhash: Keypair.generate().publicKey.toBase58(),
       lastValidBlockHeight: 999999999,
     };
+  }
+
+  async getBlockHeight() {
+    return this.height;
   }
 
   async sendRawTransaction(raw: Buffer | Uint8Array) {
@@ -94,7 +101,7 @@ class FakeChain {
   }
 }
 
-function fixture(balance = 2_000_000n) {
+function fixture(balance = 2_000_000n, abandonAfterMs?: number) {
   const dir = fs.mkdtempSync(
     path.join(os.tmpdir(), "axis-custody-transfer-"),
   );
@@ -121,6 +128,7 @@ function fixture(balance = 2_000_000n) {
     walletAddressFor: () => user.publicKey.toBase58(),
     withUserKeypair: async (_store, _owner, fn) => fn(user),
     env: {},
+    ...(abandonAfterMs === undefined ? {} : { abandonAfterMs }),
   });
 
   const input: CustodyTransferInput = {
@@ -142,6 +150,11 @@ function fixture(balance = 2_000_000n) {
     spends: new SpendLedger(dir),
     deposits: new DepositLedger(dir),
   };
+}
+
+function includes(actual: object, expected: Record<string, unknown>) {
+  const picked = Object.fromEntries(Object.keys(expected).map(k => [k, (actual as Record<string, unknown>)[k]]));
+  assert.deepEqual(picked, expected);
 }
 
 describe("custody transfer contract", () => {
@@ -352,14 +365,78 @@ describe("custody transfer contract", () => {
     }
   });
 
-  it("fails status lookup for an unknown intent", async () => {
+  it("voids an unknown intent so a late transfer with its key cannot move funds", async () => {
     const f = fixture();
-
     try {
-      await assert.rejects(
-        () => f.service.status("merchant:missing"),
-        CustodyTransferNotFound,
-      );
+      const status = await f.service.status("merchant:action-1");
+      includes(status, { status: "failed", moneyState: "RELEASED", reason: "not_submitted" });
+      await assert.rejects(() => f.service.transfer(f.input), CustodyTransferConflict);
+      assert.equal(f.chain.sent, 0);
+      assert.equal(f.spends.spentBaseUnits(f.user.publicKey.toBase58()).toString(), "0");
+    } finally {
+      fs.rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("insufficient balance is a definitive release that debits nothing", async () => {
+    const f = fixture(10n);
+    try {
+      await assert.rejects(() => f.service.transfer(f.input), InsufficientBalanceError);
+      includes(await f.service.status(f.input.idempotencyKey), { status: "failed", moneyState: "RELEASED", reason: "insufficient_balance" });
+      assert.equal(f.chain.sent, 0);
+      assert.equal(f.spends.spentBaseUnits(f.user.publicKey.toBase58()).toString(), "0");
+    } finally {
+      fs.rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("an unknown signature stays in doubt until its blockhash expires, then releases", async () => {
+    const f = fixture();
+    try {
+      f.chain.throwOnSend = true;
+      assert.equal((await f.service.transfer(f.input)).moneyState, "IN_DOUBT");
+      const owner = f.user.publicKey.toBase58();
+      f.chain.height = 999999999;
+      assert.equal((await f.service.status(f.input.idempotencyKey)).moneyState, "IN_DOUBT");
+      assert.equal(f.spends.spentBaseUnits(owner).toString(), "1000000");
+      f.chain.height = 1000000000;
+      includes(await f.service.status(f.input.idempotencyKey), { status: "failed", moneyState: "RELEASED", reason: "expired" });
+      assert.equal(f.spends.spentBaseUnits(owner).toString(), "0");
+      f.chain.verdict = "finalized";
+      assert.equal((await f.service.status(f.input.idempotencyKey)).moneyState, "RELEASED", "terminal verdicts never reopen");
+    } finally {
+      fs.rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a claim abandoned before signing is released and can never broadcast afterwards", async () => {
+    const f = fixture(2_000_000n, 0);
+    try {
+      let open!: () => void;
+      f.chain.blockGate = new Promise<void>(resolve => { open = resolve; });
+      const inFlight = f.service.transfer(f.input);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      includes(await f.service.status(f.input.idempotencyKey), { status: "failed", moneyState: "RELEASED", reason: "not_broadcast" });
+      open();
+      assert.equal((await inFlight).moneyState, "RELEASED");
+      assert.equal(f.chain.sent, 0);
+      assert.equal(f.spends.spentBaseUnits(f.user.publicKey.toBase58()).toString(), "0");
+    } finally {
+      fs.rmSync(f.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("a young unsigned claim is left alone while the transfer is still signing", async () => {
+    const f = fixture();
+    try {
+      let open!: () => void;
+      f.chain.blockGate = new Promise<void>(resolve => { open = resolve; });
+      const inFlight = f.service.transfer(f.input);
+      await new Promise(resolve => setTimeout(resolve, 20));
+      assert.equal((await f.service.status(f.input.idempotencyKey)).moneyState, "IN_DOUBT");
+      open();
+      await inFlight;
+      assert.equal(f.chain.sent, 1);
     } finally {
       fs.rmSync(f.dir, { recursive: true, force: true });
     }

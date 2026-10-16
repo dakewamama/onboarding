@@ -12,6 +12,7 @@ export interface AirtimeFulfillDeps {
   getSpend: MoneyLedger["get"];
   findSpend: MoneyLedger["findByKey"];
   setState: MoneyLedger["setState"];
+  voidUnknownKey: MoneyLedger["voidUnknownKey"];
   buyAirtime: (p: { network: string; amount: number; phone: string; requestId: string }) => Promise<AirtimeResult>;
   requery: (requestId: string) => Promise<AirtimeResult>;
 }
@@ -30,6 +31,7 @@ export interface AirtimeFulfillResult {
   chargedBaseUnits: string;
   remnantBaseUnits: string;
   requestId?: string;
+  reason?: string;
 }
 
 export class AirtimeIdentityConflict extends Error {}
@@ -101,8 +103,9 @@ export async function fulfillAirtime(deps: AirtimeFulfillDeps, params: AirtimeFu
 
 /** The service-token gate is at the HTTP boundary. No requery can create a debit. */
 export async function requeryAirtime(deps: AirtimeFulfillDeps, key: string): Promise<AirtimeFulfillResult | null> {
-  const record = await deps.findSpend(key);
-  if (!record) return null;
+  // A key never seen here is voided so a late request cannot debit under it.
+  const record = await deps.voidUnknownKey(key, "not_submitted");
+  if (!record) return { status: "failed", moneyState: "RELEASED", chargedBaseUnits: "0", remnantBaseUnits: "0", reason: "not_submitted" };
   if (["SETTLED", "RELEASED", "REVERSED"].includes(record.state ?? "")) return result(record);
   const requestId = providerId(record);
   if (!requestId) return result(record);

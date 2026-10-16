@@ -14,6 +14,7 @@ import {
   type SpendState,
 } from "./funding/spendLedger";
 import { openMoneyLedger, type MoneyLedger } from "./funding/moneyLedger";
+import { openTransferStore, type TransferStore } from "./funding/transferStore";
 
 export type CustodyTransferStatus =
   | "pending"
@@ -31,11 +32,16 @@ export interface CustodyTransferInput {
   idempotencyKey: string;
 }
 
+export type CustodyMoneyState = "PENDING" | "IN_DOUBT" | "SETTLED" | "RELEASED" | "REVERSED";
+
 export interface CustodyTransferResponse {
   status: CustodyTransferStatus;
+  /** What happened to the user's funds. failed+RELEASED means nothing left the wallet. */
+  moneyState: CustodyMoneyState;
   requestId: string;
   amountMinor: string;
   signature?: string;
+  reason?: string;
 }
 
 interface StoredTransfer extends CustodyTransferInput {
@@ -50,6 +56,8 @@ interface StoredTransfer extends CustodyTransferInput {
   lastValidBlockHeight?: number;
   broadcastAcceptedAt?: string;
   error?: string;
+  /** Why a failed transfer moved nothing: not_submitted, insufficient_balance, not_broadcast, expired. */
+  reason?: string;
 }
 
 interface Chain {
@@ -61,6 +69,8 @@ interface Chain {
     raw: Buffer | Uint8Array,
     options?: { skipPreflight?: boolean; maxRetries?: number },
   ): Promise<string>;
+
+  getBlockHeight(commitment?: "confirmed" | "finalized"): Promise<number>;
 
   getSignatureStatuses(
     signatures: string[],
@@ -88,6 +98,9 @@ export interface CustodyTransferDeps {
   ) => Promise<T>;
   env?: NodeJS.ProcessEnv;
   ledger?: MoneyLedger;
+  transferStore?: TransferStore<StoredTransfer>;
+  /** How long an unsigned claim may sit before it is treated as abandoned. */
+  abandonAfterMs?: number;
 }
 
 export class CustodyTransferConflict extends Error {}
@@ -98,15 +111,6 @@ function positive(value: string, field: string): bigint {
     throw new Error(`${field} must be a positive integer string`);
   }
   return BigInt(value);
-}
-
-function transferDir(storeDir: string): string {
-  return path.join(storeDir, "custody-transfers");
-}
-
-function transferPath(storeDir: string, key: string): string {
-  const name = createHash("sha256").update(key).digest("hex");
-  return path.join(transferDir(storeDir), `${name}.json`);
 }
 
 function stableRequestId(key: string): string {
@@ -131,74 +135,28 @@ function intentDigest(input: CustodyTransferInput): string {
     .digest("hex");
 }
 
-function readTransfer(storeDir: string, key: string): StoredTransfer {
-  const file = transferPath(storeDir, key);
-  if (!fs.existsSync(file)) {
-    throw new CustodyTransferNotFound("custody transfer not found");
-  }
-  return JSON.parse(fs.readFileSync(file, "utf8")) as StoredTransfer;
-}
-
-function writeTransfer(storeDir: string, record: StoredTransfer): void {
-  fs.mkdirSync(transferDir(storeDir), { recursive: true, mode: 0o700 });
-  const target = transferPath(storeDir, record.idempotencyKey);
-  const temp = `${target}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(temp, JSON.stringify(record, null, 2), {
-    flag: "wx",
-    mode: 0o600,
-  });
-  fs.renameSync(temp, target);
-}
-
-function claimTransfer(
-  storeDir: string,
-  input: CustodyTransferInput,
-  ledgerOwner: string,
-  digest: string,
-): { record: StoredTransfer; inserted: boolean } {
-  fs.mkdirSync(transferDir(storeDir), { recursive: true, mode: 0o700 });
-  const now = new Date().toISOString();
-  const record: StoredTransfer = {
-    ...input,
-    requestId: stableRequestId(input.idempotencyKey),
-    intentDigest: digest,
-    ledgerOwner,
-    status: "in_doubt",
-    createdAt: now,
-    updatedAt: now,
-  };
-
-  try {
-    fs.writeFileSync(
-      transferPath(storeDir, input.idempotencyKey),
-      JSON.stringify(record, null, 2),
-      { flag: "wx", mode: 0o600 },
-    );
-    return { record, inserted: true };
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error;
-
-    const existing = readTransfer(storeDir, input.idempotencyKey);
-    if (
-      existing.intentDigest !== digest ||
-      existing.ledgerOwner !== ledgerOwner
-    ) {
-      throw new CustodyTransferConflict(
-        "idempotency key already belongs to another custody transfer",
-      );
-    }
-    return { record: existing, inserted: false };
-  }
+function moneyStateOf(record: StoredTransfer): CustodyMoneyState {
+  if (record.status === "settled") return "SETTLED";
+  if (record.status === "pending") return "PENDING";
+  if (record.status === "in_doubt") return "IN_DOUBT";
+  // A failure with a landed signature consumed fees; anything else never moved funds.
+  return record.signature && !record.reason ? "REVERSED" : "RELEASED";
 }
 
 function result(record: StoredTransfer): CustodyTransferResponse {
   return {
     status: record.status,
+    moneyState: moneyStateOf(record),
     requestId: record.requestId,
     amountMinor: record.amountMinor,
     ...(record.signature ? { signature: record.signature } : {}),
+    ...(record.reason ? { reason: record.reason } : {}),
   };
 }
+
+const terminal = (r: StoredTransfer) => r.status === "settled" || r.status === "failed";
+
+class TransferSuperseded extends Error {}
 
 function base58(bytes: Uint8Array): string {
   const alphabet =
@@ -259,6 +217,7 @@ export class CustodyTransferService {
   private walletLookup: (storeDir: string, userId: string) => string | null;
   private signer: NonNullable<CustodyTransferDeps["withUserKeypair"]>;
   private ledger: MoneyLedger;
+  private store: TransferStore<StoredTransfer>;
   private env: NodeJS.ProcessEnv;
 
   constructor(private deps: CustodyTransferDeps) {
@@ -266,6 +225,7 @@ export class CustodyTransferService {
     this.signer = deps.withUserKeypair ?? withUserKeypair;
     this.env = deps.env ?? process.env;
     this.ledger = deps.ledger ?? openMoneyLedger(this.env, deps.storeDir);
+    this.store = deps.transferStore ?? openTransferStore<StoredTransfer>(this.ledger, deps.storeDir);
   }
 
   private async setSpendState(
@@ -340,17 +300,9 @@ export class CustodyTransferService {
 
     const digest = intentDigest(input);
 
-    const existingFile = transferPath(
-      this.deps.storeDir,
-      input.idempotencyKey,
-    );
+    const existing = await this.store.read(input.idempotencyKey);
 
-    if (fs.existsSync(existingFile)) {
-      const existing = readTransfer(
-        this.deps.storeDir,
-        input.idempotencyKey,
-      );
-
+    if (existing) {
       if (
         existing.intentDigest !== digest ||
         existing.ledgerOwner !== ownerAddress
@@ -363,14 +315,28 @@ export class CustodyTransferService {
       return this.reconcile(existing);
     }
 
-    const claimed = claimTransfer(
-      this.deps.storeDir,
-      input,
-      ownerAddress,
-      digest,
-    );
+    const now = new Date().toISOString();
+    const claimed = await this.store.claim({
+      ...input,
+      requestId: stableRequestId(input.idempotencyKey),
+      intentDigest: digest,
+      ledgerOwner: ownerAddress,
+      status: "in_doubt",
+      createdAt: now,
+      updatedAt: now,
+    });
 
-    if (!claimed.inserted) return this.reconcile(claimed.record);
+    if (!claimed.inserted) {
+      if (
+        claimed.record.intentDigest !== digest ||
+        claimed.record.ledgerOwner !== ownerAddress
+      ) {
+        throw new CustodyTransferConflict(
+          "idempotency key already belongs to another custody transfer",
+        );
+      }
+      return this.reconcile(claimed.record);
+    }
 
     try {
       // Axis Money checks the balance and records the debit atomically.
@@ -380,9 +346,10 @@ export class CustodyTransferService {
         ...claimed.record,
         status: "failed",
         error: (error as Error).message,
+        reason: error instanceof InsufficientBalanceError ? "insufficient_balance" : "not_debited",
         updatedAt: new Date().toISOString(),
       };
-      writeTransfer(this.deps.storeDir, failed);
+      await this.save(failed);
       throw error;
     }
 
@@ -453,8 +420,12 @@ export class CustodyTransferService {
             updatedAt: new Date().toISOString(),
           };
 
-          // Persist the immutable transaction identity before touching RPC.
-          writeTransfer(this.deps.storeDir, current);
+          // Persist the immutable transaction identity before touching RPC. If a
+          // reconcile already declared this claim abandoned, never broadcast.
+          const persisted = current;
+          if (!(await this.store.update(persisted, stored => !stored.signature && !terminal(stored)))) {
+            throw new TransferSuperseded("custody transfer was abandoned before broadcast");
+          }
 
           let returned: string;
           try {
@@ -469,7 +440,7 @@ export class CustodyTransferService {
               error: (error as Error).message,
               updatedAt: new Date().toISOString(),
             };
-            writeTransfer(this.deps.storeDir, current);
+            await this.save(current);
             await this.setSpendState(
               ownerAddress,
               input.idempotencyKey,
@@ -485,7 +456,7 @@ export class CustodyTransferService {
               error: "rpc returned a different transaction signature",
               updatedAt: new Date().toISOString(),
             };
-            writeTransfer(this.deps.storeDir, current);
+            await this.save(current);
             await this.setSpendState(
               ownerAddress,
               input.idempotencyKey,
@@ -500,7 +471,7 @@ export class CustodyTransferService {
             broadcastAcceptedAt: new Date().toISOString(),
             updatedAt: new Date().toISOString(),
           };
-          writeTransfer(this.deps.storeDir, current);
+          await this.save(current);
           await this.setSpendState(
             ownerAddress,
             input.idempotencyKey,
@@ -510,6 +481,11 @@ export class CustodyTransferService {
         this.env,
       );
     } catch (error) {
+      if (error instanceof TransferSuperseded) {
+        // Abandoned before the signature was stored: nothing was broadcast.
+        await this.setSpendState(ownerAddress, input.idempotencyKey, "RELEASED");
+        return result((await this.store.read(input.idempotencyKey))!);
+      }
       if (!current.signature) {
         await this.setSpendState(
           ownerAddress,
@@ -528,57 +504,63 @@ export class CustodyTransferService {
         ...current,
         status: current.signature ? "in_doubt" : "failed",
         error: (error as Error).message,
+        ...(current.signature ? {} : { reason: "not_broadcast" }),
         updatedAt: new Date().toISOString(),
       };
-      writeTransfer(this.deps.storeDir, current);
+      await this.save(current);
     }
 
-    return result(
-      readTransfer(this.deps.storeDir, input.idempotencyKey),
-    );
+    return result((await this.store.read(input.idempotencyKey))!);
   }
 
   async status(idempotencyKey: string): Promise<CustodyTransferResponse> {
-    return this.reconcile(
-      readTransfer(this.deps.storeDir, idempotencyKey),
-    );
+    const record = await this.store.read(idempotencyKey);
+    if (record) return this.reconcile(record);
+    // Never seen: void the key so a late request carrying it cannot claim it.
+    const now = new Date().toISOString();
+    const voided = await this.store.claim({
+      owner: "", asset: "USDC", network: "SOLANA", destination: "", amountMinor: "0", maxDebitMinor: "0",
+      idempotencyKey, requestId: stableRequestId(idempotencyKey), intentDigest: "", ledgerOwner: "",
+      status: "failed", reason: "not_submitted", createdAt: now, updatedAt: now,
+    });
+    return voided.inserted ? result(voided.record) : this.reconcile(voided.record);
+  }
+
+  /** Persist and report; if a concurrent writer already finished the record, report that. */
+  private async saved(next: StoredTransfer): Promise<CustodyTransferResponse> {
+    if (await this.save(next)) return result(next);
+    return result((await this.store.read(next.idempotencyKey))!);
+  }
+
+  /** Never overwrite a settled or failed record. */
+  private async save(next: StoredTransfer): Promise<boolean> {
+    return this.store.update(next, stored => !terminal(stored));
   }
 
   private async reconcile(
     record: StoredTransfer,
   ): Promise<CustodyTransferResponse> {
+    // Settled and failed are final; the chain is not consulted again.
+    if (terminal(record)) return result(record);
     if (!record.signature) {
-      if (record.status === "failed") return result(record);
-
-      const debit = await this.ledger.get(
-        record.ledgerOwner,
-        record.idempotencyKey,
-      );
-
-      if (!debit) {
-        const failed: StoredTransfer = {
-          ...record,
-          status: "failed",
-          error: "custody debit reservation missing",
-          updatedAt: new Date().toISOString(),
-        };
-        writeTransfer(this.deps.storeDir, failed);
-        return result(failed);
-      }
-
-      await this.setSpendState(
-        record.ledgerOwner,
-        record.idempotencyKey,
-        "IN_DOUBT",
-      );
-
-      const next: StoredTransfer = {
+      // The signature is persisted before any broadcast, so an unsigned claim has
+      // moved nothing. Give a live transfer time to sign; after that, abandon it.
+      const age = Date.now() - Date.parse(record.updatedAt);
+      if (age < (this.deps.abandonAfterMs ?? 120_000)) return result(record);
+      const abandoned: StoredTransfer = {
         ...record,
-        status: "in_doubt",
+        status: "failed",
+        reason: "not_broadcast",
+        error: "abandoned before broadcast",
         updatedAt: new Date().toISOString(),
       };
-      writeTransfer(this.deps.storeDir, next);
-      return result(next);
+      if (!(await this.store.update(abandoned, stored => !stored.signature && !terminal(stored)))) {
+        return this.reconcile((await this.store.read(record.idempotencyKey))!);
+      }
+      if (await this.ledger.get(record.ledgerOwner, record.idempotencyKey)) {
+        await this.setSpendState(record.ledgerOwner, record.idempotencyKey, "RELEASED");
+      }
+      return result(abandoned);
     }
 
     let chainStatus: {
@@ -606,8 +588,26 @@ export class CustodyTransferService {
         error: (error as Error).message,
         updatedAt: new Date().toISOString(),
       };
-      writeTransfer(this.deps.storeDir, next);
-      return result(next);
+      return this.saved(next);
+    }
+
+    if (!chainStatus && record.lastValidBlockHeight !== undefined) {
+      // Past its last valid block height a transaction can never land. Once the
+      // finalized chain is beyond it and the signature is still unknown, nothing moved.
+      let expired = false;
+      try {
+        if ((await this.deps.connection.getBlockHeight("finalized")) > record.lastValidBlockHeight) {
+          chainStatus = (await this.deps.connection.getSignatureStatuses([record.signature], { searchTransactionHistory: true })).value[0];
+          expired = !chainStatus;
+        }
+      } catch {
+        expired = false;
+      }
+      if (expired) {
+        const failed: StoredTransfer = { ...record, status: "failed", reason: "expired", updatedAt: new Date().toISOString() };
+        if (await this.save(failed)) await this.setSpendState(record.ledgerOwner, record.idempotencyKey, "RELEASED");
+        return result((await this.store.read(record.idempotencyKey))!);
+      }
     }
 
     if (!chainStatus) {
@@ -622,8 +622,7 @@ export class CustodyTransferService {
         status: "in_doubt",
         updatedAt: new Date().toISOString(),
       };
-      writeTransfer(this.deps.storeDir, next);
-      return result(next);
+      return this.saved(next);
     }
 
     if (chainStatus.confirmationStatus !== "finalized") {
@@ -638,8 +637,7 @@ export class CustodyTransferService {
         status: "pending",
         updatedAt: new Date().toISOString(),
       };
-      writeTransfer(this.deps.storeDir, next);
-      return result(next);
+      return this.saved(next);
     }
 
     if (chainStatus.err) {
@@ -654,8 +652,7 @@ export class CustodyTransferService {
         status: "failed",
         updatedAt: new Date().toISOString(),
       };
-      writeTransfer(this.deps.storeDir, next);
-      return result(next);
+      return this.saved(next);
     }
 
     await this.setSpendState(
@@ -669,8 +666,7 @@ export class CustodyTransferService {
       status: "settled",
       updatedAt: new Date().toISOString(),
     };
-    writeTransfer(this.deps.storeDir, next);
-    return result(next);
+    return this.saved(next);
   }
 }
 

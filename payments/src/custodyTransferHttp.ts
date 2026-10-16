@@ -2,6 +2,7 @@ import * as http from "http";
 import {timingSafeEqual} from "crypto";
 import {CustodyTransferConflict,CustodyTransferNotFound,custodyTransferFromEnv,type CustodyTransferInput,type CustodyTransferService} from "./custodyTransfer";
 import {squadsControlStatus} from "./squads";
+import {InsufficientBalanceError} from "./funding/spendLedger";
 export interface CustodyTransferMount{handle(req:http.IncomingMessage,res:http.ServerResponse):Promise<boolean>;logStatus(port:number):void;}
 function send(res:http.ServerResponse,status:number,body:unknown){res.writeHead(status,{"content-type":"application/json"});res.end(JSON.stringify(body));}
 function auth(header:string|undefined,token:string|undefined){if(!header?.startsWith("Bearer ")||!token)return false;const a=Buffer.from(header.slice(7));const b=Buffer.from(token);return a.length===b.length&&timingSafeEqual(a,b);}
@@ -15,7 +16,7 @@ export function mountCustodyTransfer(env:NodeJS.ProcessEnv=process.env):CustodyT
   try{
    if(url.pathname==="/wallet/transfer/status"){if(req.method!=="GET"){send(res,405,{error:"method"});return true;}const key=url.searchParams.get("idempotencyKey");if(!key){send(res,400,{error:"idempotencyKey required"});return true;}const result=await service.status(key);send(res,result.status==="pending"||result.status==="in_doubt"?202:200,result);return true;}
    if(req.method!=="POST"){send(res,405,{error:"method"});return true;}const raw=await body(req);const input:CustodyTransferInput={owner:String(raw.owner??""),asset:String(raw.asset??"") as "USDC",network:String(raw.network??"") as "SOLANA",destination:String(raw.destination??""),amountMinor:String(raw.amountMinor??""),maxDebitMinor:String(raw.maxDebitMinor??""),idempotencyKey:String(raw.idempotencyKey??"")};const result=await service.transfer(input);send(res,result.status==="pending"||result.status==="in_doubt"?202:200,result);return true;
-  }catch(error){if(error instanceof CustodyTransferConflict){send(res,409,{error:error.message});return true;}if(error instanceof CustodyTransferNotFound){send(res,404,{error:error.message});return true;}send(res,400,{error:(error as Error).message});return true;}
+  }catch(error){if(error instanceof CustodyTransferConflict){send(res,409,{error:error.message});return true;}if(error instanceof CustodyTransferNotFound){send(res,404,{error:error.message});return true;}if(error instanceof InsufficientBalanceError){send(res,402,{error:"insufficient balance",status:"failed",moneyState:"RELEASED",reason:"insufficient_balance"});return true;}send(res,400,{error:(error as Error).message});return true;}
  }
  return {handle,logStatus(port:number){const transfer=!enabled?"disabled":service?"ready":`unavailable: ${initError}`;let squads="disabled";try{squads=squadsControlStatus(env).configured?"configured":"disabled";}catch(error){squads=`invalid: ${(error as Error).message}`;}console.log(`[custody] /wallet/transfer on :${port} ${transfer}; squads ${squads}`);}};
 }
