@@ -51,6 +51,16 @@ describe("airtime HTTP ambiguity boundary", () => {
     return realFetch(`${base}/airtime/status?idempotencyKey=${key}`, { headers: { authorization: `Bearer ${token}` } });
   }
 
+  it("lists the wallet's deposits and debits for its owner, authenticated", async () => {
+    await buy();
+    const get = (token: string, user = "user") => realFetch(`${base}/wallet/activity?userId=${user}`, { headers: { authorization: `Bearer ${token}` } });
+    assert.equal((await get("wrong-token")).status, 401);
+    const a = await (await get("test-token")).json() as { deposits: { id: string; asset: string; usdcMinor: string }[]; debits: { key: string; state: string }[] };
+    assert.deepEqual(a.deposits.map(d => [d.id, d.asset, d.usdcMinor]), [["deposit-test", "USDC", "1000000"]]);
+    assert.deepEqual(a.debits.map(d => [d.key, d.state]), [["axis-case", "IN_DOUBT"]]);
+    assert.deepEqual(await (await get("test-token", "nobody")).json(), { deposits: [], debits: [] });
+  });
+
   it("returns HTTP 202 IN_DOUBT for timeout and replay; requery settles the same debit", async () => {
     for (let i = 0; i < 2; i++) {
       const response = await buy();

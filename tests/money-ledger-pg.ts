@@ -59,6 +59,7 @@ describe("Axis Money Postgres ledger", function () {
     assert.equal(r.record.state, "IN_DOUBT");
     assert.equal((await b.get(owner, "custody-1"))?.state, "IN_DOUBT");
     assert.equal((await a.availableBaseUnits(owner)).toString(), "600");
+    assert.deepEqual((await b.spends(owner)).map(r => [r.idempotencyKey, r.paidBaseUnits, r.state]), [["custody-1", "400", "IN_DOUBT"]]);
   });
 
   it("concurrent spends from two processes cannot overdraw", async () => {

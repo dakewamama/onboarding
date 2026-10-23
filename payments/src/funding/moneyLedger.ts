@@ -62,6 +62,8 @@ export interface MoneyLedger {
   /** Terminal states (SETTLED, RELEASED, REVERSED) never change. */
   setState(owner: string, key: string, state: SpendState): Promise<SpendRecord>;
   spentBaseUnits(owner: string): Promise<bigint>;
+  /** The owner's spends, newest first: the wallet's debit history. */
+  spends(owner: string, limit?: number): Promise<SpendRecord[]>;
   poolGainBaseUnits(): Promise<bigint>;
   close(): Promise<void>;
 }
@@ -103,6 +105,7 @@ export class FileMoneyLedger implements MoneyLedger {
   async findByKey(key: string) { return this.spendsLedger.findByKey(key); }
   async setState(owner: string, key: string, state: SpendState) { return this.spendsLedger.setState(owner, key, state); }
   async spentBaseUnits(owner: string) { return this.spendsLedger.spentBaseUnits(owner); }
+  async spends(owner: string, limit = 100) { return this.spendsLedger.records(owner).sort((a, b) => b.at.localeCompare(a.at)).slice(0, limit); }
   async poolGainBaseUnits() { return this.spendsLedger.poolGainBaseUnits(); }
   async close() {}
 }
@@ -313,6 +316,12 @@ export class PostgresMoneyLedger implements MoneyLedger {
   async get(owner: string, key: string): Promise<SpendRecord | null> {
     await this.migrate();
     return this.row(this.pool, owner, key);
+  }
+
+  async spends(owner: string, limit = 100): Promise<SpendRecord[]> {
+    await this.migrate();
+    const r = await this.pool.query("SELECT * FROM money_spends WHERE owner=$1 ORDER BY at DESC LIMIT $2", [owner, limit]);
+    return r.rows.map(toSpend);
   }
 
   async findByKey(key: string): Promise<SpendRecord | null> {

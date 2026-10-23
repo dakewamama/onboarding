@@ -103,7 +103,7 @@ export function mountAirtime(
     res: http.ServerResponse,
   ): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
-    const routes = ["/airtime/status", "/airtime", "/airtime/link", "/airtime/provision", "/airtime/rate", "/wallet", "/wallet/balance"];
+    const routes = ["/airtime/status", "/airtime", "/airtime/link", "/airtime/provision", "/airtime/rate", "/wallet", "/wallet/balance", "/wallet/activity"];
     if (!routes.includes(url.pathname)) return false;
 
     // Token gates everything. The VTpass/rate `enabled` gate applies only to the
@@ -123,6 +123,36 @@ export function mountAirtime(
       } catch {
         return void send(res, 202, { status: "in_doubt", moneyState: "IN_DOUBT" }), true;
       }
+    }
+
+    // The wallet's own record: credited deposits and debits, newest first.
+    // GET ?userId=... — no wallet yet => empty lists, not an error.
+    if (url.pathname === "/wallet/activity") {
+      const userId = url.searchParams.get("userId") ?? "";
+      if (!userId) return void send(res, 400, { error: "userId required" }), true;
+      const address = identity.addressFor(userId);
+      if (!address) return void send(res, 200, { deposits: [], debits: [] }), true;
+      const [deposits, spends] = await Promise.all([ledger.deposits(address), ledger.spends(address, 100)]);
+      send(res, 200, {
+        address,
+        deposits: deposits.slice(0, 100).map((d) => ({
+          id: d.signature,
+          // The on-chain transaction, without the ":sol" suffix SOL credits are keyed by.
+          signature: d.signature.replace(/:sol$/, ""),
+          asset: d.asset === "sol" ? "SOL" : "USDC",
+          usdcMinor: d.baseUnits,
+          ...(d.lamports ? { lamports: d.lamports } : {}),
+          at: d.at,
+        })),
+        debits: spends.map((s) => ({
+          key: s.idempotencyKey,
+          usdcMinor: s.paidBaseUnits,
+          reason: s.reason,
+          state: s.state ?? "SETTLED",
+          at: s.at,
+        })),
+      });
+      return true;
     }
 
     // Spendable balance for a user (deposits minus spends), with an NGN estimate.
