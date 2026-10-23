@@ -52,6 +52,15 @@ describe("Axis Money Postgres ledger", function () {
     assert.isFalse(await credit(a, "dep", "zero", 0));
   });
 
+  it("a custody reserve is created IN_DOUBT in the same write, never held without a state", async () => {
+    const owner = `owner-${randomUUID()}`;
+    await a.credit({ signature: `sig-${randomUUID()}`, owner, baseUnits: "1000", commitment: "finalized" });
+    const r = await a.spend({ owner, idempotencyKey: "custody-1", paidBaseUnits: u(400), costBaseUnits: u(400), reason: "merchant custody transfer", provider: "custody", requestFingerprint: "f" });
+    assert.equal(r.record.state, "IN_DOUBT");
+    assert.equal((await b.get(owner, "custody-1"))?.state, "IN_DOUBT");
+    assert.equal((await a.availableBaseUnits(owner)).toString(), "600");
+  });
+
   it("concurrent spends from two processes cannot overdraw", async () => {
     await credit(a, "race", "sig", 100);
     const attempts = Array.from({ length: 10 }, (_, i) =>

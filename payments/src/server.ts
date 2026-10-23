@@ -1,10 +1,7 @@
 /**
- * Minimal webhook receiver (devnet/staging prototype). Reads the RAW body (never
- * pre-parsed, so the signature verifies), runs the handler, and returns the
- * status Paj expects. In production this sits behind TLS + a real framework.
- *
- *   PAJ_API_KEY=... PAJ_WEBHOOK_SECRET=whsec_... PAJ_ENV=staging \
- *   yarn run paj-webhook-server
+ * The payments service: custodial wallets, airtime, custody transfers, deposit
+ * watching and the PAJ webhook receiver. Axis Money (the ledger) must be
+ * configured before anything else starts.
  */
 import * as http from "http";
 import { loadConfig } from "./config";
@@ -28,14 +25,15 @@ try {
   process.exit(1);
 }
 
-// Keep the receiver alive through background faults. The funding watcher polls an
-// external RPC that can rate-limit or blip; a stray rejection there must never
-// take down the webhook receiver (which handles money). Log loudly, stay up.
+// A stray rejection (e.g. an RPC blip in a watcher poll) is logged and survived.
+// An uncaught exception leaves the process in an unknown state: exit and let the
+// platform restart it, rather than keep moving money from a corrupted process.
 process.on("unhandledRejection", (reason) => {
-  console.error("[fatal] unhandledRejection (kept alive):", reason);
+  console.error("[error] unhandledRejection:", reason);
 });
 process.on("uncaughtException", (err) => {
-  console.error("[fatal] uncaughtException (kept alive):", err);
+  console.error("[fatal] uncaughtException; exiting:", err);
+  process.exit(1);
 });
 
 const cfg = loadConfig();
@@ -48,10 +46,11 @@ if (!cfg.webhookSecret) {
 const provider = new PajProvider(cfg);
 const PORT = Number(process.env.PORT ?? 8788);
 
-// Replace this with your real crediting logic (e.g. release funds to the user).
-async function credit(s: Settlement): Promise<void> {
+// PAJ settlements are recorded, not credited: nothing in this service holds a
+// balance for PAJ orders (brain reconciles its own payouts). Log for audit.
+async function recordSettlement(s: Settlement): Promise<void> {
   console.log(
-    `[credit] order=${s.reference ?? "?"} pajId=${s.pajId} usdc=${s.amountUsdc} status=${s.status}`
+    `[paj] settled order=${s.reference ?? "?"} pajId=${s.pajId} usdc=${s.amountUsdc} status=${s.status}`
   );
 }
 
@@ -74,7 +73,7 @@ async function handlePajWebhook(req: http.IncomingMessage, res: http.ServerRespo
   req.on("end", async () => {
     const rawBody = Buffer.concat(chunks).toString("utf8");
     try {
-      const result = await handleWebhook(provider, rawBody, req.headers, credit);
+      const result = await handleWebhook(provider, rawBody, req.headers, recordSettlement);
       console.log(`[webhook] ${result.status} ${result.note}`);
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify({ note: result.note }));

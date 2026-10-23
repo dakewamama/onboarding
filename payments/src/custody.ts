@@ -11,14 +11,13 @@ import { Keypair } from "@solana/web3.js";
  * Envelope encryption: a Solana secret key wrapped with AES-256-GCM under
  * KEYSTORE_MASTER_KEY (32 bytes / 64 hex). Fail-closed: no master key => throws.
  *
- * NOTE (consolidation debt): server/src/keyCipher holds the same crypto, but
- * server/ is NOT deployed (the Railway image builds only payments/). This is the
- * production custody home; the two should be unified once custody consolidates
- * into one deployed service. Records live under the funding store dir, so they
- * persist on the same Railway Volume as the ledgers (mount /data before mainnet).
+ * Records live under the funding store dir, on the same volume as the ledgers
+ * (mount /data in production, or keys are lost on redeploy).
  */
 
 interface WalletRecord {
+  /** The exact owner. Absent only in records written before owners were recorded. */
+  userId?: string;
   publicKey: string;
   iv: string;
   tag: string;
@@ -39,14 +38,41 @@ function walletsDir(storeDir: string): string {
   return path.join(storeDir, "wallets");
 }
 
+/** Collision-free file per exact userId ("web:1" and "web_1" are different users). */
 function walletPath(storeDir: string, userId: string): string {
-  return path.join(walletsDir(storeDir), `${safe(userId)}.json`);
+  return path.join(walletsDir(storeDir), `u_${crypto.createHash("sha256").update(userId).digest("hex")}.json`);
+}
+
+/** Pre-hash file name, which could be shared by ids that differ only in punctuation. */
+function legacyWalletPath(storeDir: string, userId: string): string {
+  return path.join(walletsDir(storeDir), `${userId.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
+}
+
+/**
+ * The user's wallet record, or null. A legacy record is claimed by the first
+ * exact userId that reads it: copied to that user's own file with its owner
+ * recorded, the old file kept as `.migrated`. Any other id mapping to the same
+ * legacy file is refused, so two users can never share keys.
+ */
+function loadWallet(storeDir: string, userId: string): WalletRecord | null {
+  const own = walletPath(storeDir, userId);
+  if (fs.existsSync(own)) {
+    const rec = JSON.parse(fs.readFileSync(own, "utf8")) as WalletRecord;
+    if (rec.userId !== userId) throw new Error("wallet owner mismatch");
+    return rec;
+  }
+  const legacy = legacyWalletPath(storeDir, userId);
+  if (!fs.existsSync(legacy)) return null;
+  const rec = JSON.parse(fs.readFileSync(legacy, "utf8")) as WalletRecord;
+  if (rec.userId !== undefined && rec.userId !== userId) throw new Error("wallet belongs to another user");
+  const claimed: WalletRecord = { ...rec, userId };
+  fs.writeFileSync(own, JSON.stringify(claimed, null, 2), { flag: "wx", mode: 0o600 });
+  fs.renameSync(legacy, `${legacy}.migrated`);
+  return claimed;
 }
 
 export function walletAddressFor(storeDir: string, userId: string): string | null {
-  const p = walletPath(storeDir, userId);
-  if (!fs.existsSync(p)) return null;
-  return (JSON.parse(fs.readFileSync(p, "utf8")) as WalletRecord).publicKey;
+  return loadWallet(storeDir, userId)?.publicKey ?? null;
 }
 
 /** Create (idempotently) a custodial wallet for a user and return its address.
@@ -68,6 +94,7 @@ export function provisionWallet(
     cipher.final(),
   ]);
   const record: WalletRecord = {
+    userId,
     publicKey: kp.publicKey.toBase58(),
     iv: iv.toString("hex"),
     tag: cipher.getAuthTag().toString("hex"),
@@ -88,9 +115,8 @@ export async function withUserKeypair<T>(
   fn: (kp: Keypair) => Promise<T>,
   env: NodeJS.ProcessEnv = process.env,
 ): Promise<T> {
-  const p = walletPath(storeDir, userId);
-  if (!fs.existsSync(p)) throw new Error(`no wallet for ${userId}`);
-  const rec = JSON.parse(fs.readFileSync(p, "utf8")) as WalletRecord;
+  const rec = loadWallet(storeDir, userId);
+  if (!rec) throw new Error(`no wallet for ${userId}`);
   const decipher = crypto.createDecipheriv(
     "aes-256-gcm",
     masterKey(env),
@@ -107,8 +133,4 @@ export async function withUserKeypair<T>(
   } finally {
     secret.fill(0);
   }
-}
-
-function safe(s: string): string {
-  return s.replace(/[^a-zA-Z0-9_-]/g, "_");
 }

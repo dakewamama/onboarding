@@ -75,7 +75,7 @@ export async function handleWebhook(
   }
 
   await onCredit(settlement);
-  return { status: 200, note: "settled and credited", settlement, credited: true };
+  return { status: 200, note: "settled", settlement, credited: true };
 }
 
 function header(

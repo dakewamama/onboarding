@@ -10,3 +10,9 @@ payments/dist/
 .funding-store/
 payments/.funding-store/
 payments/.paj-store/
+
+# Local secrets: never commit
+.env
+.env.*
+!.env.example
+!**/.env.example

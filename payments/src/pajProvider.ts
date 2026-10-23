@@ -76,6 +76,7 @@ export class PajProvider implements PaymentProvider {
     signatureHeader: string | undefined,
     timestampHeader: string | undefined
   ): boolean {
+    if (!this.cfg.webhookSecret) return false; // no secret: every webhook is rejected
     return verifyWebhookSignature(
       rawBody,
       signatureHeader,

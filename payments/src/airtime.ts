@@ -1,6 +1,6 @@
 import * as http from "http";
+import { bearerAuthorized, readJson, send } from "./httpUtil";
 import { URL } from "url";
-import { timingSafeEqual } from "crypto";
 import { VtpassClient, VtpassEnv, serviceIdFor } from "./vtpassClient";
 import { InsufficientBalanceError } from "./funding/spendLedger";
 import { openMoneyLedger, SpendKeyVoidedError } from "./funding/moneyLedger";
@@ -8,7 +8,8 @@ import { fundingStoreDir } from "./funding/config";
 import { usdcToNgnRate, offRampNgnPerUsdc } from "./rate";
 import { fulfillAirtime, requeryAirtime, AirtimeIdentityConflict, AirtimeFulfillDeps } from "./airtimeFulfill";
 import { IdentityStore } from "./identity";
-import { provisionWallet } from "./custody";
+import { provisionWallet, walletAddressFor } from "./custody";
+import { PublicKey } from "@solana/web3.js";
 import { PajClient } from "./pajClient";
 import type { Currency } from "./types";
 
@@ -95,14 +96,7 @@ export function mountAirtime(
     buyAirtime: (p) => client!.buyAirtime(p),
   };
 
-  function authorized(req: http.IncomingMessage): boolean {
-    const header = req.headers.authorization ?? "";
-    const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!token || !provided) return false;
-    const a = Buffer.from(provided);
-    const b = Buffer.from(token);
-    return a.length === b.length && timingSafeEqual(a, b);
-  }
+  const authorized = (req: http.IncomingMessage) => bearerAuthorized(req, token);
 
   async function handle(
     req: http.IncomingMessage,
@@ -187,23 +181,42 @@ export function mountAirtime(
         } catch (e) {
           return void send(res, 503, { error: (e as Error).message }), true;
         }
-        identity.link(userId, wallet.address);
+        try {
+          identity.link(userId, wallet.address);
+        } catch (e) {
+          return void send(res, 409, { error: (e as Error).message }), true;
+        }
         try {
           armWatch?.(wallet.address); // credit deposits to this wallet automatically
-        } catch {
-          // watch arming is best-effort; balance still reconciles once armed
+        } catch (e) {
+          // The balance still reconciles once the watch is armed on a later call.
+          console.warn("[wallet] could not arm deposit watch:", (e as Error).message);
         }
         return void send(res, 200, wallet), true;
       }
 
-      // Link a userId to an externally-provided wallet address (manual path).
+      // Link a userId to an externally-held wallet (manual path). A user with an
+      // Axis custodial wallet stays on it: their balance is keyed by that address.
       if (url.pathname === "/airtime/link") {
         const userId = String(body.userId ?? "");
         const address = String(body.address ?? "");
         if (!userId || !address) {
           return void send(res, 400, { error: "userId and address are required" }), true;
         }
-        identity.link(userId, address);
+        try {
+          new PublicKey(address);
+        } catch {
+          return void send(res, 400, { error: "address is not a Solana public key" }), true;
+        }
+        const custodial = walletAddressFor(storeDir, userId);
+        if (custodial && custodial !== address) {
+          return void send(res, 409, { error: "user already has an Axis wallet" }), true;
+        }
+        try {
+          identity.link(userId, address);
+        } catch (e) {
+          return void send(res, 409, { error: (e as Error).message }), true;
+        }
         return void send(res, 200, { userId, address }), true;
       }
 
@@ -285,16 +298,4 @@ export function mountAirtime(
   }
 
   return { handle, logStatus };
-}
-
-async function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
-  const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
-}
-
-function send(res: http.ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "content-type": "application/json" });
-  res.end(JSON.stringify(body));
 }

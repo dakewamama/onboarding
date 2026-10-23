@@ -1,6 +1,6 @@
 import * as http from "http";
+import { bearerAuthorized, readJson, send } from "./httpUtil";
 import { URL } from "url";
-import { timingSafeEqual } from "crypto";
 import { PajClient } from "./pajClient";
 import { PajConfig } from "./config";
 
@@ -34,14 +34,7 @@ export function mountOfframp(cfg: PajConfig): OfframpMount {
         ? "PAJ_API_KEY not set"
         : "";
 
-  function authorized(req: http.IncomingMessage): boolean {
-    const header = req.headers.authorization ?? "";
-    const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!token || !provided) return false;
-    const a = Buffer.from(provided);
-    const b = Buffer.from(token);
-    return a.length === b.length && timingSafeEqual(a, b);
-  }
+  const authorized = (req: http.IncomingMessage) => bearerAuthorized(req, token);
 
   async function handle(
     req: http.IncomingMessage,
@@ -115,16 +108,4 @@ export function mountOfframp(cfg: PajConfig): OfframpMount {
   }
 
   return { handle, logStatus };
-}
-
-async function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
-  const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
-}
-
-function send(res: http.ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "content-type": "application/json" });
-  res.end(JSON.stringify(body));
 }

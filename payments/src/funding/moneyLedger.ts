@@ -37,7 +37,8 @@ export interface SpendInput {
   paidBaseUnits: bigint;
   costBaseUnits: bigint;
   reason: string;
-  provider?: "vtpass";
+  /** Spends with a provider start IN_DOUBT, in the same write as the reserve. */
+  provider?: "vtpass" | "custody";
   requestFingerprint?: string;
 }
 
@@ -410,7 +411,7 @@ function toSpend(row: Record<string, unknown>): SpendRecord {
     paidBaseUnits: paid, costBaseUnits: cost, remnantBaseUnits: (BigInt(paid) - BigInt(cost)).toString(),
     reason: String(row.reason), at: new Date(row.at as string).toISOString(),
     ...(row.state ? { state: row.state as SpendState } : {}),
-    ...(row.provider ? { provider: row.provider as "vtpass" } : {}),
+    ...(row.provider ? { provider: row.provider as "vtpass" | "custody" } : {}),
     ...(row.request_fingerprint ? { requestFingerprint: String(row.request_fingerprint) } : {}),
   };
 }

@@ -96,10 +96,10 @@ that's fine. For real settlement correlation, attach a Railway volume and point
 
 ## Crypto funding (USDC on Solana) + persistent volume
 
-The same service also serves the additive USDC-funding routes (`/funding/*`) when
-`SOLANA_RPC_URL` is set (otherwise inert; Paj runs unchanged). Env: `SOLANA_RPC_URL`,
-`SOLANA_USDC_MINT`, `SOLANA_COMMITMENT`, `FUNDING_CORS_ORIGINS` (the browser
-frontend's origin).
+The same service serves the USDC-funding routes (`/funding/*`) when
+`SOLANA_RPC_URL` is set (otherwise they return 503). They are server-to-server
+only and need the `INTERNAL_API_TOKEN` bearer. Env: `SOLANA_RPC_URL`,
+`SOLANA_USDC_MINT`, `SOLANA_COMMITMENT`.
 
 Balances, spends and deposits live in **Axis Money**, a double-entry ledger in
 Postgres (`payments/src/funding/moneyLedger.ts`). Set `DATABASE_URL`; the image runs

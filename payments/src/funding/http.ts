@@ -2,11 +2,12 @@ import * as http from "http";
 import { URL } from "url";
 import { FundingService } from "./service";
 import { loadFundingConfig } from "./config";
+import { bearerAuthorized, readJson, send } from "../httpUtil";
 
 /**
- * Framework-free HTTP surface for the crypto-funding flow, mounted alongside the
- * Paj webhook receiver in server.ts. If SOLANA_RPC_URL is not configured, this is
- * inert — the Paj receiver keeps working untouched, and /funding/* returns 503.
+ * HTTP surface for crypto funding, mounted in server.ts. Every route needs the
+ * INTERNAL_API_TOKEN bearer (server-to-server only). Without SOLANA_RPC_URL the
+ * routes return 503.
  *
  * Routes (step 1 — deposit-address display + credit-on-confirmation):
  *   POST /funding/address        { owner }                       -> address + QR, arms watch
@@ -21,9 +22,10 @@ export interface FundingMount {
   armWatch: ((owner: string) => void) | null;
 }
 
-export function mountFunding(): FundingMount {
+export function mountFunding(env: NodeJS.ProcessEnv = process.env): FundingMount {
   let service: FundingService | null = null;
   let disabledReason = "";
+  const token = env.INTERNAL_API_TOKEN;
 
   try {
     service = new FundingService(loadFundingConfig());
@@ -32,39 +34,16 @@ export function mountFunding(): FundingMount {
     disabledReason = (err as Error).message;
   }
 
-  // Resolve the CORS origin to echo for this request against the configured
-  // allowlist. Returns null when the request origin isn't allowed (no header set).
-  function allowedOrigin(reqOrigin: string | undefined): string | null {
-    const allow = service ? service.config.corsOrigins : [];
-    if (allow.length === 0) return null;
-    if (allow.includes("*")) return "*";
-    return reqOrigin && allow.includes(reqOrigin) ? reqOrigin : null;
-  }
+  const text = (body: Record<string, unknown>, key: string) => (typeof body[key] === "string" ? (body[key] as string).trim() : "");
 
-  async function handle(
-    req: http.IncomingMessage,
-    res: http.ServerResponse
-  ): Promise<boolean> {
+  async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
     if (!url.pathname.startsWith("/funding/")) return false;
-
-    // CORS: the browser frontend (Vercel) calls this backend (Railway) cross-origin.
-    const origin = allowedOrigin(
-      Array.isArray(req.headers.origin) ? req.headers.origin[0] : req.headers.origin
-    );
-    if (origin) {
-      res.setHeader("Access-Control-Allow-Origin", origin);
-      res.setHeader("Vary", "Origin");
-      res.setHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
-      res.setHeader("Access-Control-Allow-Headers", "content-type");
-      res.setHeader("Access-Control-Max-Age", "86400");
-    }
-    // Answer the preflight before any routing/auth.
-    if (req.method === "OPTIONS") {
-      res.writeHead(origin ? 204 : 403).end();
+    // Balances and deposit history are per user: brain calls these server-to-server.
+    if (!bearerAuthorized(req, token)) {
+      send(res, token ? 401 : 503, { error: token ? "unauthorized" : "INTERNAL_API_TOKEN not set" });
       return true;
     }
-
     if (!service) {
       send(res, 503, { error: "crypto funding not configured", detail: disabledReason });
       return true;
@@ -72,37 +51,30 @@ export function mountFunding(): FundingMount {
 
     try {
       if (req.method === "POST" && url.pathname === "/funding/address") {
-        const body = await readJson(req);
-        const owner = String((body as any).owner ?? "");
-        if (!owner) return void send(res, 400, { error: "owner is required" }), true;
+        const owner = text(await readJson(req), "owner");
+        if (!owner) { send(res, 400, { error: "owner is required" }); return true; }
         send(res, 200, service.issueDepositAddress(owner));
         return true;
       }
 
       if (req.method === "POST" && url.pathname === "/funding/build-transfer") {
-        const body = (await readJson(req)) as any;
-        const fromWallet = String(body.fromWallet ?? "");
-        const owner = String(body.owner ?? "");
-        const amountUsdc = String(body.amountUsdc ?? "");
-        if (!fromWallet || !owner || !amountUsdc) {
-          return void send(res, 400, {
-            error: "fromWallet, owner and amountUsdc are required",
-          }), true;
-        }
+        const body = await readJson(req);
+        const fromWallet = text(body, "fromWallet"), owner = text(body, "owner"), amountUsdc = text(body, "amountUsdc");
+        if (!fromWallet || !owner || !amountUsdc) { send(res, 400, { error: "fromWallet, owner and amountUsdc are required" }); return true; }
         send(res, 200, await service.buildTransfer(fromWallet, owner, amountUsdc));
         return true;
       }
 
       if (req.method === "GET" && url.pathname === "/funding/balance") {
         const owner = url.searchParams.get("owner");
-        if (!owner) return void send(res, 400, { error: "owner is required" }), true;
+        if (!owner) { send(res, 400, { error: "owner is required" }); return true; }
         send(res, 200, await service.balance(owner));
         return true;
       }
 
       if (req.method === "GET" && url.pathname === "/funding/deposits") {
         const owner = url.searchParams.get("owner");
-        if (!owner) return void send(res, 400, { error: "owner is required" }), true;
+        if (!owner) { send(res, 400, { error: "owner is required" }); return true; }
         send(res, 200, { owner, deposits: await service.deposits(owner) });
         return true;
       }
@@ -132,26 +104,4 @@ export function mountFunding(): FundingMount {
     logStatus,
     armWatch: service ? (owner: string) => service!.armWatch(owner) : null,
   };
-}
-
-function send(res: http.ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "content-type": "application/json" });
-  res.end(JSON.stringify(body));
-}
-
-function readJson(req: http.IncomingMessage): Promise<unknown> {
-  return new Promise((resolve, reject) => {
-    const chunks: Buffer[] = [];
-    req.on("data", (c) => chunks.push(c as Buffer));
-    req.on("end", () => {
-      const raw = Buffer.concat(chunks).toString("utf8").trim();
-      if (!raw) return resolve({});
-      try {
-        resolve(JSON.parse(raw));
-      } catch {
-        reject(new Error("invalid JSON body"));
-      }
-    });
-    req.on("error", reject);
-  });
 }

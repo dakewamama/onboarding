@@ -36,7 +36,7 @@ export interface SpendRecord {
   reason: string;
   at: string;
   state?: SpendState;
-  provider?: "vtpass";
+  provider?: "vtpass" | "custody";
   requestFingerprint?: string;
 }
 
@@ -131,7 +131,7 @@ export class SpendLedger {
       paidBaseUnits: bigint;
       costBaseUnits: bigint;
       reason: string;
-      provider?: "vtpass";
+      provider?: "vtpass" | "custody";
       requestFingerprint?: string;
     },
     availableBaseUnits: bigint,
