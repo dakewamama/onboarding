@@ -29,12 +29,15 @@ export class SolWatcher {
   private backoffMs = 0;
   private static readonly BASE_BACKOFF_MS = 30_000;
   private static readonly MAX_BACKOFF_MS = 300_000;
+  /** Pages of new signatures read per owner per poll. */
+  private static readonly MAX_PAGES = 20;
 
   constructor(
     private cfg: FundingConfig,
     private ledger: Pick<MoneyLedger, "credit" | "hasCredited">,
     private onCredit: (r: CreditRecord) => void | Promise<void> = () => {},
     connection?: Connection,
+    private price: () => Promise<number> = () => solUsdcPrice(),
   ) {
     this.connection =
       connection ??
@@ -76,71 +79,116 @@ export class SolWatcher {
     return delta > BigInt(0) ? delta : BigInt(0);
   }
 
-  /** Value lamports as integer USDC base units (6dp), rounded DOWN. */
+  /** Value lamports as integer USDC base units (6dp), rounded DOWN, in exact integer math. */
   private toUsdcBase(lamports: bigint, priceUsdcPerSol: number): bigint {
-    // usdcBase = floor(lamports/1e9 * price * 1e6) = floor(lamports * price / 1000)
-    const micro = (Number(lamports) * priceUsdcPerSol) / 1000;
-    return BigInt(Math.floor(micro));
+    const priceMicro = BigInt(Math.round(priceUsdcPerSol * 1_000_000));
+    return (lamports * priceMicro) / BigInt(1_000_000_000);
   }
 
+  /** This watcher's own cursor file, apart from the USDC watcher's, so neither overwrites the other. */
+  private cursorFile(owner: string): string {
+    return path.join(this.cfg.storeDir, "sol-cursor", `${owner.replace(/[^a-zA-Z0-9_-]/g, "_")}.json`);
+  }
+
+  /** Newest signature on the wallet fully handled by this watcher. */
+  private cursor(owner: string): string | undefined {
+    const file = this.cursorFile(owner);
+    return fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf8")).cursor as string | undefined) : undefined;
+  }
+
+  private saveCursor(owner: string, cursor: string): void {
+    const file = this.cursorFile(owner);
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify({ owner, cursor }, null, 2));
+  }
+
+  /**
+   * Every signature on the wallet since the cursor, page by page, handled oldest
+   * first. The cursor only advances over signatures that are settled one way or
+   * the other, so a deposit short of commitment, or one waiting on a price, is
+   * looked at again next poll.
+   */
   async scanOwner(owner: string): Promise<void> {
     const pubkey = new PublicKey(owner);
-    const sigs = await this.connection.getSignaturesForAddress(pubkey, {
-      limit: this.cfg.pageSize,
-    });
-
-    for (const info of sigs) {
-      if (info.err) continue;
-      if (!this.meetsCommitment(info.confirmationStatus)) continue;
-      const key = `${info.signature}:sol`;
-      if (await this.ledger.hasCredited(owner, key)) continue;
-
-      const tx = await this.connection.getParsedTransaction(info.signature, {
-        commitment: this.cfg.commitment,
-        maxSupportedTransactionVersion: 0,
+    const until = this.cursor(owner);
+    const newestFirst: { signature: string; err: unknown; confirmationStatus?: string | null }[] = [];
+    let before: string | undefined;
+    let complete = false;
+    for (let page = 0; page < SolWatcher.MAX_PAGES; page++) {
+      const sigs = await this.connection.getSignaturesForAddress(pubkey, {
+        limit: this.cfg.pageSize,
+        ...(until ? { until } : {}),
+        ...(before ? { before } : {}),
       });
-      if (!tx || tx.meta?.err) continue;
+      newestFirst.push(...sigs);
+      if (sigs.length < this.cfg.pageSize) { complete = true; break; }
+      before = sigs[sigs.length - 1].signature;
+    }
+    if (!complete) {
+      console.warn(`[funding] ${owner}: more than ${SolWatcher.MAX_PAGES} pages of new activity; SOL cursor held until it is all seen`);
+    }
 
-      const lamports = this.incomingLamports(tx, owner);
-      if (lamports <= BigInt(0)) continue;
+    let advance = complete;
+    for (const info of newestFirst.reverse()) {
+      if (!(await this.handleSignature(owner, info))) advance = false;
+      if (advance) this.saveCursor(owner, info.signature);
+    }
+  }
 
-      // Price at credit time. Fail-closed: on any error, skip and retry next poll.
-      let price: number;
-      try {
-        price = await solUsdcPrice();
-      } catch (err) {
-        console.warn(
-          `[funding] SOL price unavailable; deferring credit of ${info.signature}:`,
-          (err as Error).message,
-        );
-        continue;
-      }
+  /** True once the signature needs no further look: failed, not a SOL deposit, or credited. */
+  private async handleSignature(owner: string, info: { signature: string; err: unknown; confirmationStatus?: string | null }): Promise<boolean> {
+    if (info.err) return true;
+    if (!this.meetsCommitment(info.confirmationStatus)) return false;
+    const key = `${info.signature}:sol`;
+    if (await this.ledger.hasCredited(owner, key)) return true;
 
-      const baseUnits = this.toUsdcBase(lamports, price);
-      if (baseUnits <= BigInt(0)) continue;
+    const tx = await this.connection.getParsedTransaction(info.signature, {
+      commitment: this.cfg.commitment,
+      maxSupportedTransactionVersion: 0,
+    });
+    if (!tx) return false;
+    if (tx.meta?.err) return true;
 
-      const fresh = await this.ledger.credit({
+    const lamports = this.incomingLamports(tx, owner);
+    if (lamports <= BigInt(0)) return true;
+
+    // Price at credit time. Fail-closed: on any error, retry next poll.
+    let price: number;
+    try {
+      price = await this.price();
+    } catch (err) {
+      console.warn(
+        `[funding] SOL price unavailable; deferring credit of ${info.signature}:`,
+        (err as Error).message,
+      );
+      return false;
+    }
+
+    const baseUnits = this.toUsdcBase(lamports, price);
+    if (baseUnits <= BigInt(0)) return true;
+
+    const fresh = await this.ledger.credit({
+      signature: key,
+      owner,
+      baseUnits: baseUnits.toString(),
+      commitment: this.cfg.commitment,
+      asset: "sol",
+      lamports: lamports.toString(),
+      priceUsdcPerSol: price,
+    });
+    if (fresh) {
+      await this.onCredit({
         signature: key,
         owner,
         baseUnits: baseUnits.toString(),
         commitment: this.cfg.commitment,
+        at: new Date().toISOString(),
         asset: "sol",
         lamports: lamports.toString(),
         priceUsdcPerSol: price,
       });
-      if (fresh) {
-        await this.onCredit({
-          signature: key,
-          owner,
-          baseUnits: baseUnits.toString(),
-          commitment: this.cfg.commitment,
-          at: new Date().toISOString(),
-          asset: "sol",
-          lamports: lamports.toString(),
-          priceUsdcPerSol: price,
-        });
-      }
     }
+    return true;
   }
 
   async pollOnce(): Promise<void> {
