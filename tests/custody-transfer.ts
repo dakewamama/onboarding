@@ -7,6 +7,7 @@ import {
   CustodyTransferConflict,
   CustodyTransferNotFound,
   CustodyTransferService,
+  solPayoutFormFromEnv,
   type CustodyTransferInput,
 } from "../payments/src/custodyTransfer";
 import { DepositLedger } from "../payments/src/funding/depositLedger";
@@ -463,6 +464,13 @@ describe("custody transfer contract", () => {
       f.chain.lamports = 1_000_000_000;
       return { ...f, input: { ...f.input, asset: "SOL" as const, amountMinor: "7000000" } }; // 0.007 SOL = 1.05 USDC
     };
+
+    it("default to native SOL, the form PAJ accepts; off disables them", () => {
+      assert.deepEqual(solPayoutFormFromEnv({}), { solPayoutForm: "native" });
+      assert.deepEqual(solPayoutFormFromEnv({ AXIS_SOL_PAYOUT_FORM: "wrapped" }), { solPayoutForm: "wrapped" });
+      assert.deepEqual(solPayoutFormFromEnv({ AXIS_SOL_PAYOUT_FORM: "off" }), {});
+      assert.throws(() => solPayoutFormFromEnv({ AXIS_SOL_PAYOUT_FORM: "yes" }));
+    });
 
     it("are refused unless a payout form is configured", async () => {
       const f = sol();

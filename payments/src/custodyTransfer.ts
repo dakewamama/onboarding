@@ -40,8 +40,8 @@ export interface CustodyTransferInput {
 }
 
 /**
- * How SOL is sent to a payout address: as a native lamport transfer, or as wrapped
- * SOL to the address's wSOL token account. Unset: SOL transfers are refused.
+ * How SOL is sent to a payout address: as a native lamport transfer (what PAJ
+ * accepts), or as wrapped SOL to the address's wSOL token account.
  */
 export type SolPayoutForm = "native" | "wrapped";
 
@@ -776,9 +776,10 @@ export function custodyTransferFromEnv(
   });
 }
 
-function solPayoutFormFromEnv(env: NodeJS.ProcessEnv): { solPayoutForm?: SolPayoutForm } {
-  const form = env.AXIS_SOL_PAYOUT_FORM?.trim();
-  if (!form) return {};
-  if (form !== "native" && form !== "wrapped") throw new Error("AXIS_SOL_PAYOUT_FORM must be native or wrapped");
+/** PAJ accepts native SOL at its deposit address, so that is the default; "off" disables SOL payouts. */
+export function solPayoutFormFromEnv(env: NodeJS.ProcessEnv): { solPayoutForm?: SolPayoutForm } {
+  const form = env.AXIS_SOL_PAYOUT_FORM?.trim() || "native";
+  if (form === "off") return {};
+  if (form !== "native" && form !== "wrapped") throw new Error("AXIS_SOL_PAYOUT_FORM must be native, wrapped or off");
   return { solPayoutForm: form };
 }
