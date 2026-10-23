@@ -7,8 +7,25 @@ import * as path from "path";
 import { FileMoneyLedger, PostgresMoneyLedger, SpendKeyVoidedError } from "../payments/src/funding/moneyLedger";
 import { PostgresTransferStore, importTransferFiles } from "../payments/src/funding/transferStore";
 import { InsufficientBalanceError } from "../payments/src/funding/spendLedger";
+import { PostgresWalletAccounts, WalletConflict } from "../payments/src/accounts";
+import { provisionWallet } from "../payments/src/custody";
+import { IdentityStore } from "../payments/src/identity";
+import { Keypair } from "@solana/web3.js";
+import * as crypto from "crypto";
 
 const url = process.env.TEST_DATABASE_URL;
+
+/** Assert the promise rejects with this error class or a message matching the pattern. */
+async function rejects(p: Promise<unknown>, expected?: (new (...a: any[]) => Error) | RegExp) {
+  try {
+    await p;
+  } catch (error) {
+    if (expected instanceof RegExp) assert.match((error as Error).message, expected);
+    else if (expected) assert.instanceOf(error, expected);
+    return;
+  }
+  assert.fail("expected a rejection");
+}
 const u = (n: number) => BigInt(n);
 
 describe("Axis Money Postgres ledger", function () {
@@ -60,6 +77,59 @@ describe("Axis Money Postgres ledger", function () {
     assert.equal((await b.get(owner, "custody-1"))?.state, "IN_DOUBT");
     assert.equal((await a.availableBaseUnits(owner)).toString(), "600");
     assert.deepEqual((await b.spends(owner)).map(r => [r.idempotencyKey, r.paidBaseUnits, r.state]), [["custody-1", "400", "IN_DOUBT"]]);
+  });
+
+  it("wallet accounts: one custodial wallet per user across processes, keys decrypt, conflicts refused", async () => {
+    const env = { KEYSTORE_MASTER_KEY: crypto.randomBytes(32).toString("hex") } as NodeJS.ProcessEnv;
+    const x = new PostgresWalletAccounts(a.pool, env), y = new PostgresWalletAccounts(b.pool, env);
+    const user = `web:${randomUUID()}`;
+    const results = await Promise.all([x.provision(user), y.provision(user), x.provision(user)]);
+    assert.equal(new Set(results.map(r => r.address)).size, 1, "concurrent provisioning yields one wallet");
+    assert.equal(results.filter(r => r.created).length, 1);
+    const address = results[0].address;
+    assert.equal(await y.addressFor(user), address);
+    assert.equal(await y.userFor(address), user);
+    assert.equal(await x.withKeypair(user, async kp => kp.publicKey.toBase58()), address);
+    // Punctuation-only differences are different users with different wallets.
+    const other = await x.provision(user.replace(":", "_"));
+    assert.notEqual(other.address, address);
+    // External links: never onto someone else's address, never beside a custodial wallet.
+    const external = Keypair.generate().publicKey.toBase58();
+    await rejects(x.linkExternal(`ext-${randomUUID()}`, address), WalletConflict);
+    await rejects(x.linkExternal(user, external), WalletConflict);
+    const ext = `ext-${randomUUID()}`;
+    await x.linkExternal(ext, external);
+    await x.linkExternal(ext, external); // same link again is fine
+    await rejects(x.provision(ext), WalletConflict);
+    await rejects(x.withKeypair(ext, async () => 1), /no wallet/);
+    // A wrong master key cannot open the wallet.
+    await rejects(new PostgresWalletAccounts(a.pool, { KEYSTORE_MASTER_KEY: crypto.randomBytes(32).toString("hex") } as NodeJS.ProcessEnv).withKeypair(user, async () => 1));
+  });
+
+  it("imports file wallets and identity links once, matching each key to its exact owner", async () => {
+    const env = { KEYSTORE_MASTER_KEY: crypto.randomBytes(32).toString("hex") } as NodeJS.ProcessEnv;
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), "accounts-import-"));
+    const owned = provisionWallet(dir, `web_${randomUUID()}`, env); // new layout: records its owner
+    // Old layout: a key file without an owner, matched through the identity link of its address.
+    const oldUser = `web_${randomUUID()}`, old = provisionWallet(dir, `tmp-${randomUUID()}`, env);
+    const wallets = path.join(dir, "wallets");
+    const oldFile = fs.readdirSync(wallets).find(f => JSON.parse(fs.readFileSync(path.join(wallets, f), "utf8")).publicKey === old.address)!;
+    const rec = JSON.parse(fs.readFileSync(path.join(wallets, oldFile), "utf8")); delete rec.userId;
+    fs.rmSync(path.join(wallets, oldFile)); fs.writeFileSync(path.join(wallets, `${oldUser}.json`), JSON.stringify(rec));
+    const identity = new IdentityStore(dir); identity.link(oldUser, old.address);
+    // An ownerless key with no identity link is reported, never guessed.
+    const orphan = provisionWallet(dir, `orphan-${randomUUID()}`, env);
+    const orphanFile = fs.readdirSync(wallets).find(f => f.startsWith("u_") && JSON.parse(fs.readFileSync(path.join(wallets, f), "utf8")).publicKey === orphan.address)!;
+    const orec = JSON.parse(fs.readFileSync(path.join(wallets, orphanFile), "utf8")); delete orec.userId;
+    fs.writeFileSync(path.join(wallets, orphanFile), JSON.stringify(orec));
+    const accounts = new PostgresWalletAccounts(a.pool, env);
+    const first = await accounts.importFiles(dir);
+    assert.equal(first.wallets, 2);
+    assert.deepEqual(first.unresolved, [orphanFile]);
+    assert.equal(await accounts.custodialAddress(owned.userId), owned.address);
+    assert.equal(await accounts.custodialAddress(oldUser), old.address);
+    assert.equal(await accounts.withKeypair(oldUser, async kp => kp.publicKey.toBase58()), old.address, "the imported key still opens");
+    assert.deepEqual((await accounts.importFiles(dir)).wallets, 0, "a second import changes nothing");
   });
 
   it("concurrent spends from two processes cannot overdraw", async () => {

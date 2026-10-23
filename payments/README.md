@@ -117,8 +117,15 @@ if any owner would be left negative.
 Custody-transfer records live in Postgres too (`custody_transfers`), and every
 update after the first claim is a compare-and-set, so a status reconcile and an
 in-progress transfer can never both win. `yarn money-import` copies existing
-transfer files as well. The `/data` volume is still used for custodial wallet
-keys and the identity map, so keep it mounted.
+transfer files as well.
+
+Wallets live in Postgres too (`wallet_accounts`): one row per user and per
+address, holding either an Axis custodial wallet (its key wrapped with
+`KEYSTORE_MASTER_KEY`) or an external wallet the user linked. Balances, airtime
+and custody transfers all resolve a user through it. `yarn money-import` copies
+existing wallet files, matching each key to its exact owner, and exits with code
+2 if any key file's owner cannot be established. The `/data` volume now only
+holds the deposit watchlist and scan cursors.
 
 ### Definitive failures (no money moved)
 

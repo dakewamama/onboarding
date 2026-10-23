@@ -11,7 +11,7 @@ import {
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
 import { solUsdcPrice } from "./funding/solPrice";
-import { walletAddressFor, withUserKeypair } from "./custody";
+import { openWalletAccounts, type WalletAccounts } from "./accounts";
 import { fundingStoreDir, loadFundingConfig } from "./funding/config";
 import {
   InsufficientBalanceError,
@@ -127,13 +127,8 @@ export interface CustodyTransferDeps {
   mint: PublicKey;
   commitment: "confirmed" | "finalized";
   operator: Keypair;
-  walletAddressFor?: (storeDir: string, userId: string) => string | null;
-  withUserKeypair?: <T>(
-    storeDir: string,
-    userId: string,
-    fn: (kp: Keypair) => Promise<T>,
-    env?: NodeJS.ProcessEnv,
-  ) => Promise<T>;
+  /** The users' custodial wallets; defaults to the process-wide wallet store. */
+  accounts?: Pick<WalletAccounts, "custodialAddress" | "withKeypair">;
   env?: NodeJS.ProcessEnv;
   ledger?: MoneyLedger;
   transferStore?: TransferStore<StoredTransfer>;
@@ -258,17 +253,15 @@ function loadOperator(env: NodeJS.ProcessEnv): Keypair {
 }
 
 export class CustodyTransferService {
-  private walletLookup: (storeDir: string, userId: string) => string | null;
-  private signer: NonNullable<CustodyTransferDeps["withUserKeypair"]>;
+  private accounts: Pick<WalletAccounts, "custodialAddress" | "withKeypair">;
   private ledger: MoneyLedger;
   private store: TransferStore<StoredTransfer>;
   private env: NodeJS.ProcessEnv;
 
   constructor(private deps: CustodyTransferDeps) {
-    this.walletLookup = deps.walletAddressFor ?? walletAddressFor;
-    this.signer = deps.withUserKeypair ?? withUserKeypair;
     this.env = deps.env ?? process.env;
     this.ledger = deps.ledger ?? openMoneyLedger(this.env, deps.storeDir);
+    this.accounts = deps.accounts ?? openWalletAccounts(this.ledger, deps.storeDir, this.env);
     this.store = deps.transferStore ?? openTransferStore<StoredTransfer>(this.ledger, deps.storeDir);
   }
 
@@ -343,7 +336,7 @@ export class CustodyTransferService {
 
   /** On-chain USDC and SOL in the user's custodial wallet. */
   async holdings(owner: string): Promise<CustodyHoldings> {
-    const address = this.walletLookup(this.deps.storeDir, owner);
+    const address = await this.accounts.custodialAddress(owner);
     if (!address) throw new CustodyTransferNotFound("owner wallet not provisioned");
     const key = new PublicKey(address);
     const lamports = await this.deps.connection.getBalance(key, this.deps.commitment);
@@ -377,7 +370,7 @@ export class CustodyTransferService {
     }
 
     const destination = new PublicKey(input.destination);
-    const ownerAddress = this.walletLookup(this.deps.storeDir, input.owner);
+    const ownerAddress = await this.accounts.custodialAddress(input.owner);
     if (!ownerAddress) throw new Error("owner wallet not provisioned");
 
     const ownerKey = new PublicKey(ownerAddress);
@@ -479,8 +472,7 @@ export class CustodyTransferService {
         this.deps.commitment,
       );
 
-      await this.signer(
-        this.deps.storeDir,
+      await this.accounts.withKeypair(
         input.owner,
         async (user) => {
           if (!user.publicKey.equals(ownerKey)) {
@@ -568,7 +560,6 @@ export class CustodyTransferService {
             "PENDING",
           );
         },
-        this.env,
       );
     } catch (error) {
       if (error instanceof TransferSuperseded) {

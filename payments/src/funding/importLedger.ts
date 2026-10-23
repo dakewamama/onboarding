@@ -2,8 +2,9 @@ import { Pool } from "pg";
 import { fundingStoreDir } from "./config";
 import { PostgresMoneyLedger } from "./moneyLedger";
 import { importTransferFiles } from "./transferStore";
+import { PostgresWalletAccounts } from "../accounts";
 
-/** Copy the legacy JSON-file ledger into Axis Money. Safe to re-run. */
+/** Copy the legacy JSON files (ledger, transfers, wallets, identity links) into Postgres. Safe to re-run. */
 async function main(): Promise<void> {
   const url = process.env.MONEY_DATABASE_URL ?? process.env.DATABASE_URL;
   if (!url) throw new Error("DATABASE_URL is required");
@@ -12,8 +13,10 @@ async function main(): Promise<void> {
   try {
     const report = await ledger.importFileLedger(dir);
     const transfers = await importTransferFiles(ledger, dir);
-    console.log(JSON.stringify({ dir, ...report, transfers }));
-    if (report.negativeOwners.length) process.exitCode = 2;
+    const accounts = await new PostgresWalletAccounts(ledger.pool).importFiles(dir);
+    console.log(JSON.stringify({ dir, ...report, transfers, accounts }));
+    // Unresolved wallet files hold keys with no known owner: stop and look before going on.
+    if (report.negativeOwners.length || accounts.unresolved.length) process.exitCode = 2;
   } finally {
     await ledger.close();
   }

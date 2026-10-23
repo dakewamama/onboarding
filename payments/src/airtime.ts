@@ -7,8 +7,7 @@ import { openMoneyLedger, SpendKeyVoidedError } from "./funding/moneyLedger";
 import { fundingStoreDir } from "./funding/config";
 import { usdcToNgnRate, offRampNgnPerUsdc } from "./rate";
 import { fulfillAirtime, requeryAirtime, AirtimeIdentityConflict, AirtimeFulfillDeps } from "./airtimeFulfill";
-import { IdentityStore } from "./identity";
-import { provisionWallet, walletAddressFor } from "./custody";
+import { openWalletAccounts, WalletConflict } from "./accounts";
 import { PublicKey } from "@solana/web3.js";
 import { PajClient } from "./pajClient";
 import type { Currency } from "./types";
@@ -83,7 +82,7 @@ export function mountAirtime(
 
   const storeDir = fundingStoreDir(env);
   const ledger = openMoneyLedger(env, storeDir);
-  const identity = new IdentityStore(storeDir);
+  const accounts = openWalletAccounts(ledger, storeDir, env);
   const deps: AirtimeFulfillDeps = {
     getRate,
     marginBps,
@@ -130,7 +129,7 @@ export function mountAirtime(
     if (url.pathname === "/wallet/activity") {
       const userId = url.searchParams.get("userId") ?? "";
       if (!userId) return void send(res, 400, { error: "userId required" }), true;
-      const address = identity.addressFor(userId);
+      const address = await accounts.addressFor(userId);
       if (!address) return void send(res, 200, { deposits: [], debits: [] }), true;
       const [deposits, spends] = await Promise.all([ledger.deposits(address), ledger.spends(address, 100)]);
       send(res, 200, {
@@ -161,7 +160,7 @@ export function mountAirtime(
     if (url.pathname === "/wallet/balance") {
       const userId = url.searchParams.get("userId") ?? "";
       if (!userId) return void send(res, 400, { error: "userId required" }), true;
-      const address = identity.addressFor(userId);
+      const address = await accounts.addressFor(userId);
       const base = address
         ? await ledger.availableBaseUnits(address)
         : BigInt(0);
@@ -198,23 +197,17 @@ export function mountAirtime(
         return void send(res, 400, { error: "invalid JSON" }), true;
       }
 
-      // THE user's wallet: create it once (idempotent), link userId <-> address,
-      // and arm the deposit watch so any USDC sent to it is credited. This is what
-      // auth calls — one wallet per user, billed for everything. (/airtime/provision
-      // is a legacy alias for the same thing.) Needs only KEYSTORE_MASTER_KEY.
+      // THE user's wallet: created once, and the deposit watch armed so anything
+      // sent to it is credited. One wallet per user, used for everything.
+      // (/airtime/provision is a legacy alias.) Needs KEYSTORE_MASTER_KEY.
       if (url.pathname === "/wallet" || url.pathname === "/airtime/provision") {
         const userId = String(body.userId ?? "");
         if (!userId) return void send(res, 400, { error: "userId is required" }), true;
         let wallet: { userId: string; address: string; created: boolean };
         try {
-          wallet = provisionWallet(storeDir, userId, env);
+          wallet = await accounts.provision(userId);
         } catch (e) {
-          return void send(res, 503, { error: (e as Error).message }), true;
-        }
-        try {
-          identity.link(userId, wallet.address);
-        } catch (e) {
-          return void send(res, 409, { error: (e as Error).message }), true;
+          return void send(res, e instanceof WalletConflict ? 409 : 503, { error: (e as Error).message }), true;
         }
         try {
           armWatch?.(wallet.address); // credit deposits to this wallet automatically
@@ -238,14 +231,11 @@ export function mountAirtime(
         } catch {
           return void send(res, 400, { error: "address is not a Solana public key" }), true;
         }
-        const custodial = walletAddressFor(storeDir, userId);
-        if (custodial && custodial !== address) {
-          return void send(res, 409, { error: "user already has an Axis wallet" }), true;
-        }
         try {
-          identity.link(userId, address);
+          await accounts.linkExternal(userId, address);
         } catch (e) {
-          return void send(res, 409, { error: (e as Error).message }), true;
+          if (e instanceof WalletConflict) return void send(res, 409, { error: e.message }), true;
+          throw e;
         }
         return void send(res, 200, { userId, address }), true;
       }
@@ -265,10 +255,10 @@ export function mountAirtime(
       // Resolve to the single money key: the custodial wallet address deposits are
       // credited under. rawOwner is normally a userId; accept a linked address too.
       let owner: string;
-      const mapped = identity.addressFor(rawOwner);
+      const mapped = await accounts.addressFor(rawOwner);
       if (mapped) {
         owner = mapped; // rawOwner was a userId
-      } else if (identity.userFor(rawOwner)) {
+      } else if (await accounts.userFor(rawOwner)) {
         owner = rawOwner; // rawOwner was already the linked address
       } else {
         return void (await rejectBeforeDebit(res, idempotencyKey, 409, "no_wallet",
