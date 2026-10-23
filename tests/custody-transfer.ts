@@ -2,7 +2,7 @@ import * as fs from "fs";
 import * as os from "os";
 import * as path from "path";
 import assert from "node:assert/strict";
-import { Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import { Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import {
   CustodyTransferConflict,
   CustodyTransferNotFound,
@@ -47,6 +47,18 @@ function base58(bytes: Uint8Array): string {
 
 class FakeChain {
   sent = 0;
+  lamports = 0;
+  usdc: string | null = null;
+  last?: Transaction;
+
+  async getBalance() {
+    return this.lamports;
+  }
+
+  async getTokenAccountBalance() {
+    if (this.usdc === null) throw new Error("failed to get token account balance: Invalid param: could not find account");
+    return { value: { amount: this.usdc } };
+  }
   throwOnSend = false;
   verdict: "none" | "confirmed" | "finalized" | "failed" = "none";
   height = 100;
@@ -67,6 +79,7 @@ class FakeChain {
   async sendRawTransaction(raw: Buffer | Uint8Array) {
     this.sent++;
     const tx = Transaction.from(Buffer.from(raw));
+    this.last = tx;
     if (!tx.signature) throw new Error("missing transaction signature");
 
     const signature = base58(tx.signature);
@@ -101,7 +114,7 @@ class FakeChain {
   }
 }
 
-function fixture(balance = 2_000_000n, abandonAfterMs?: number) {
+function fixture(balance = 2_000_000n, abandonAfterMs?: number, extra: Partial<ConstructorParameters<typeof CustodyTransferService>[0]> = {}) {
   const dir = fs.mkdtempSync(
     path.join(os.tmpdir(), "axis-custody-transfer-"),
   );
@@ -129,6 +142,7 @@ function fixture(balance = 2_000_000n, abandonAfterMs?: number) {
     withUserKeypair: async (_store, _owner, fn) => fn(user),
     env: {},
     ...(abandonAfterMs === undefined ? {} : { abandonAfterMs }),
+    ...extra,
   });
 
   const input: CustodyTransferInput = {
@@ -440,5 +454,90 @@ describe("custody transfer contract", () => {
     } finally {
       fs.rmSync(f.dir, { recursive: true, force: true });
     }
+  });
+
+  describe("SOL payouts", () => {
+    // 1 SOL = 150 USDC. Balance 2 USDC; the approved maximum is 1.1 USDC.
+    const sol = (form?: "native" | "wrapped") => {
+      const f = fixture(2_000_000n, undefined, { ...(form ? { solPayoutForm: form } : {}), solPrice: async () => 150 });
+      f.chain.lamports = 1_000_000_000;
+      return { ...f, input: { ...f.input, asset: "SOL" as const, amountMinor: "7000000" } }; // 0.007 SOL = 1.05 USDC
+    };
+
+    it("are refused unless a payout form is configured", async () => {
+      const f = sol();
+      try {
+        await assert.rejects(() => f.service.transfer(f.input), /SOL payouts are not enabled/);
+        assert.equal(f.chain.sent, 0);
+      } finally {
+        fs.rmSync(f.dir, { recursive: true, force: true });
+      }
+    });
+
+    it("send native lamports and debit their USDC value", async () => {
+      const f = sol("native");
+      try {
+        const r = await f.service.transfer(f.input);
+        assert.equal(f.chain.sent, 1);
+        includes(r, { asset: "SOL", amountMinor: "7000000", debitMinor: "1050000" });
+        const spend = f.spends.get(f.user.publicKey.toBase58(), f.input.idempotencyKey)!;
+        assert.equal(spend.paidBaseUnits, "1050000");
+        const [ix] = f.chain.last!.instructions;
+        assert.equal(f.chain.last!.instructions.length, 1);
+        assert.ok(ix.programId.equals(SystemProgram.programId));
+        assert.ok(ix.keys[1].pubkey.equals(new PublicKey(f.input.destination)));
+      } finally {
+        fs.rmSync(f.dir, { recursive: true, force: true });
+      }
+    });
+
+    it("send wrapped SOL to the destination's token account and close the temporary account to the user", async () => {
+      const f = sol("wrapped");
+      try {
+        await f.service.transfer(f.input);
+        const ixs = f.chain.last!.instructions;
+        assert.equal(ixs.length, 6);
+        const close = ixs[5];
+        assert.ok(close.keys[1].pubkey.equals(f.user.publicKey), "rent returns to the user");
+      } finally {
+        fs.rmSync(f.dir, { recursive: true, force: true });
+      }
+    });
+
+    it("never debit more than the user approved: refused and released before anything moves", async () => {
+      const f = sol("native");
+      try {
+        const r = await f.service.transfer({ ...f.input, amountMinor: "8000000" }); // 1.2 USDC > 1.1
+        includes(r, { status: "failed", moneyState: "RELEASED", reason: "above_max_debit" });
+        assert.equal(f.chain.sent, 0);
+        assert.equal(f.spends.get(f.user.publicKey.toBase58(), f.input.idempotencyKey), null);
+      } finally {
+        fs.rmSync(f.dir, { recursive: true, force: true });
+      }
+    });
+
+    it("refuse to empty a wallet below rent, or spend SOL it does not hold", async () => {
+      const f = sol("native");
+      try {
+        f.chain.lamports = 7_500_000; // would leave 500,000 lamports: below rent exemption
+        includes(await f.service.transfer(f.input), { status: "failed", moneyState: "RELEASED", reason: "would_strand_rent" });
+        f.chain.lamports = 1_000;
+        includes(await f.service.transfer({ ...f.input, idempotencyKey: "merchant:action-2" }), { reason: "insufficient_sol" });
+        assert.equal(f.chain.sent, 0);
+      } finally {
+        fs.rmSync(f.dir, { recursive: true, force: true });
+      }
+    });
+
+    it("report holdings, treating a wallet with no USDC account as zero", async () => {
+      const f = sol("native");
+      try {
+        assert.deepEqual(await f.service.holdings("web:test"), { address: f.user.publicKey.toBase58(), usdcMinor: "0", lamports: "1000000000", solPayouts: "native" });
+        f.chain.usdc = "2500000";
+        assert.equal((await f.service.holdings("web:test")).usdcMinor, "2500000");
+      } finally {
+        fs.rmSync(f.dir, { recursive: true, force: true });
+      }
+    });
   });
 });

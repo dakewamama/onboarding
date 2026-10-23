@@ -22,6 +22,7 @@ const statusCode = (status: string) => (status === "pending" || status === "in_d
  * Brain's custody transfer routes (INTERNAL_API_TOKEN bearer):
  *   POST /wallet/transfer                     move USDC from a user's custodial wallet
  *   GET  /wallet/transfer/status?idempotencyKey=
+ *   GET  /wallet/holdings?userId=              on-chain USDC and SOL, and whether SOL can fund payouts
  *   GET  /treasury/status                      treasury control configuration
  */
 export function mountCustodyTransfer(env: NodeJS.ProcessEnv = process.env): CustodyTransferMount {
@@ -39,7 +40,7 @@ export function mountCustodyTransfer(env: NodeJS.ProcessEnv = process.env): Cust
 
   async function handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
-    const transfer = url.pathname === "/wallet/transfer" || url.pathname === "/wallet/transfer/status";
+    const transfer = url.pathname === "/wallet/transfer" || url.pathname === "/wallet/transfer/status" || url.pathname === "/wallet/holdings";
     const treasury = url.pathname === "/treasury/status";
     if (!transfer && !treasury) return false;
     if (!token) { send(res, 503, { error: "INTERNAL_API_TOKEN not set" }); return true; }
@@ -58,6 +59,14 @@ export function mountCustodyTransfer(env: NodeJS.ProcessEnv = process.env): Cust
     if (!service) { send(res, 503, { error: initError || "AXIS_CUSTODY_TRANSFER_ENABLED is not true" }); return true; }
 
     try {
+      if (url.pathname === "/wallet/holdings") {
+        if (req.method !== "GET") { send(res, 405, { error: "method" }); return true; }
+        const userId = url.searchParams.get("userId");
+        if (!userId) { send(res, 400, { error: "userId required" }); return true; }
+        send(res, 200, await service.holdings(userId));
+        return true;
+      }
+
       if (url.pathname === "/wallet/transfer/status") {
         if (req.method !== "GET") { send(res, 405, { error: "method" }); return true; }
         const key = url.searchParams.get("idempotencyKey");
@@ -78,7 +87,7 @@ export function mountCustodyTransfer(env: NodeJS.ProcessEnv = process.env): Cust
       const text = (key: string) => (typeof raw[key] === "string" ? (raw[key] as string) : "");
       const input: CustodyTransferInput = {
         owner: text("owner"),
-        asset: text("asset") as "USDC",
+        asset: text("asset") as CustodyTransferInput["asset"],
         network: text("network") as "SOLANA",
         destination: text("destination"),
         amountMinor: text("amountMinor"),

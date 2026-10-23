@@ -1,12 +1,16 @@
 import * as fs from "fs";
 import * as path from "path";
 import { createHash } from "crypto";
-import { Connection, Keypair, PublicKey, Transaction } from "@solana/web3.js";
+import { Connection, Keypair, PublicKey, SystemProgram, Transaction } from "@solana/web3.js";
 import {
+  NATIVE_MINT,
   createAssociatedTokenAccountIdempotentInstruction,
+  createCloseAccountInstruction,
+  createSyncNativeInstruction,
   createTransferCheckedInstruction,
   getAssociatedTokenAddressSync,
 } from "@solana/spl-token";
+import { solUsdcPrice } from "./funding/solPrice";
 import { walletAddressFor, withUserKeypair } from "./custody";
 import { fundingStoreDir, loadFundingConfig } from "./funding/config";
 import {
@@ -21,15 +25,28 @@ export type CustodyTransferStatus =
   | "failed"
   | "in_doubt";
 
+export type CustodyAsset = "USDC" | "SOL";
+
 export interface CustodyTransferInput {
   owner: string;
-  asset: "USDC";
+  asset: CustodyAsset;
   network: "SOLANA";
   destination: string;
+  /** Base units of `asset`: USDC (6 decimals) or lamports (9). */
   amountMinor: string;
+  /** Most the user's balance may be debited, in USDC base units (the ledger's unit). */
   maxDebitMinor: string;
   idempotencyKey: string;
 }
+
+/**
+ * How SOL is sent to a payout address: as a native lamport transfer, or as wrapped
+ * SOL to the address's wSOL token account. Unset: SOL transfers are refused.
+ */
+export type SolPayoutForm = "native" | "wrapped";
+
+/** A system account must hold 0 or at least this many lamports (rent exemption). */
+const RENT_EXEMPT_MIN_LAMPORTS = 890_880n;
 
 export type CustodyMoneyState = "PENDING" | "IN_DOUBT" | "SETTLED" | "RELEASED" | "REVERSED";
 
@@ -38,9 +55,20 @@ export interface CustodyTransferResponse {
   /** What happened to the user's funds. failed+RELEASED means nothing left the wallet. */
   moneyState: CustodyMoneyState;
   requestId: string;
+  asset: CustodyAsset;
   amountMinor: string;
+  /** What the user's balance was debited, in USDC base units. */
+  debitMinor?: string;
   signature?: string;
   reason?: string;
+}
+
+/** What the user's custodial wallet holds on chain, and whether SOL can fund a payout. */
+export interface CustodyHoldings {
+  address: string;
+  usdcMinor: string;
+  lamports: string;
+  solPayouts: SolPayoutForm | null;
 }
 
 interface StoredTransfer extends CustodyTransferInput {
@@ -57,6 +85,10 @@ interface StoredTransfer extends CustodyTransferInput {
   error?: string;
   /** Why a failed transfer moved nothing: not_submitted, insufficient_balance, not_broadcast, expired. */
   reason?: string;
+  /** USDC base units debited from the user's balance (equals amountMinor for USDC). */
+  debitMinor?: string;
+  /** For SOL: the price used, in USDC base units per SOL. */
+  solPriceMicro?: string;
 }
 
 interface Chain {
@@ -70,6 +102,13 @@ interface Chain {
   ): Promise<string>;
 
   getBlockHeight(commitment?: "confirmed" | "finalized"): Promise<number>;
+
+  getBalance(address: PublicKey, commitment?: "confirmed" | "finalized"): Promise<number>;
+
+  getTokenAccountBalance(
+    address: PublicKey,
+    commitment?: "confirmed" | "finalized",
+  ): Promise<{ value: { amount: string } }>;
 
   getSignatureStatuses(
     signatures: string[],
@@ -100,6 +139,10 @@ export interface CustodyTransferDeps {
   transferStore?: TransferStore<StoredTransfer>;
   /** How long an unsigned claim may sit before it is treated as abandoned. */
   abandonAfterMs?: number;
+  /** SOL payouts are off unless this is set (see SolPayoutForm). */
+  solPayoutForm?: SolPayoutForm;
+  /** USDC per SOL; defaults to the live price used for SOL deposits. */
+  solPrice?: () => Promise<number>;
 }
 
 export class CustodyTransferConflict extends Error {}
@@ -147,7 +190,9 @@ function result(record: StoredTransfer): CustodyTransferResponse {
     status: record.status,
     moneyState: moneyStateOf(record),
     requestId: record.requestId,
+    asset: record.asset,
     amountMinor: record.amountMinor,
+    ...(record.debitMinor ? { debitMinor: record.debitMinor } : {}),
     ...(record.signature ? { signature: record.signature } : {}),
     ...(record.reason ? { reason: record.reason } : {}),
   };
@@ -227,10 +272,11 @@ export class CustodyTransferService {
     this.store = deps.transferStore ?? openTransferStore<StoredTransfer>(this.ledger, deps.storeDir);
   }
 
+  /** Debit `debit` USDC base units from the user's balance for this request. */
   private async reserve(
     ledgerOwner: string,
     input: CustodyTransferInput,
-    amount: bigint,
+    debit: bigint,
     digest: string,
   ): Promise<void> {
     const existing = await this.ledger.get(ledgerOwner, input.idempotencyKey);
@@ -252,9 +298,9 @@ export class CustodyTransferService {
       {
         owner: ledgerOwner,
         idempotencyKey: input.idempotencyKey,
-        paidBaseUnits: amount,
-        costBaseUnits: amount,
-        reason: "merchant custody transfer",
+        paidBaseUnits: debit,
+        costBaseUnits: debit,
+        reason: input.asset === "SOL" ? "merchant custody transfer (SOL)" : "merchant custody transfer",
         provider: "custody",
         requestFingerprint: digest,
       },
@@ -267,11 +313,58 @@ export class CustodyTransferService {
     }
   }
 
+  /** The instructions that move `amount` of `asset` from the user to `destination`. The operator pays fees and account rent. */
+  private instructions(asset: CustodyAsset, user: PublicKey, destination: PublicKey, amount: bigint) {
+    const operator = this.deps.operator.publicKey;
+    if (asset === "SOL" && this.deps.solPayoutForm === "native") {
+      return [SystemProgram.transfer({ fromPubkey: user, toPubkey: destination, lamports: amount })];
+    }
+    if (asset === "SOL") {
+      // Wrapped: fund a temporary wSOL account, send it as a token, then close it.
+      // Closing returns its rent to the user, never any of the user's other funds.
+      const source = getAssociatedTokenAddressSync(NATIVE_MINT, user);
+      const target = getAssociatedTokenAddressSync(NATIVE_MINT, destination, true);
+      return [
+        createAssociatedTokenAccountIdempotentInstruction(operator, target, destination, NATIVE_MINT),
+        createAssociatedTokenAccountIdempotentInstruction(operator, source, user, NATIVE_MINT),
+        SystemProgram.transfer({ fromPubkey: user, toPubkey: source, lamports: amount }),
+        createSyncNativeInstruction(source),
+        createTransferCheckedInstruction(source, NATIVE_MINT, target, user, amount, 9),
+        createCloseAccountInstruction(source, user, user),
+      ];
+    }
+    const source = getAssociatedTokenAddressSync(this.deps.mint, user);
+    const target = getAssociatedTokenAddressSync(this.deps.mint, destination, true);
+    return [
+      createAssociatedTokenAccountIdempotentInstruction(operator, target, destination, this.deps.mint),
+      createTransferCheckedInstruction(source, this.deps.mint, target, user, amount, 6),
+    ];
+  }
+
+  /** On-chain USDC and SOL in the user's custodial wallet. */
+  async holdings(owner: string): Promise<CustodyHoldings> {
+    const address = this.walletLookup(this.deps.storeDir, owner);
+    if (!address) throw new CustodyTransferNotFound("owner wallet not provisioned");
+    const key = new PublicKey(address);
+    const lamports = await this.deps.connection.getBalance(key, this.deps.commitment);
+    let usdcMinor = "0";
+    try {
+      usdcMinor = (await this.deps.connection.getTokenAccountBalance(getAssociatedTokenAddressSync(this.deps.mint, key), this.deps.commitment)).value.amount;
+    } catch (error) {
+      // A wallet that never received USDC has no token account; anything else is a real failure.
+      if (!/could not find account|Invalid param/i.test((error as Error).message)) throw error;
+    }
+    return { address, usdcMinor, lamports: String(lamports), solPayouts: this.deps.solPayoutForm ?? null };
+  }
+
   async transfer(
     input: CustodyTransferInput,
   ): Promise<CustodyTransferResponse> {
-    if (input.asset !== "USDC" || input.network !== "SOLANA") {
+    if ((input.asset !== "USDC" && input.asset !== "SOL") || input.network !== "SOLANA") {
       throw new Error("unsupported custody asset or network");
+    }
+    if (input.asset === "SOL" && !this.deps.solPayoutForm) {
+      throw new Error("SOL payouts are not enabled");
     }
     if (!input.owner || !input.idempotencyKey) {
       throw new Error("owner and idempotencyKey are required");
@@ -279,7 +372,7 @@ export class CustodyTransferService {
 
     const amount = positive(input.amountMinor, "amountMinor");
     const maxDebit = positive(input.maxDebitMinor, "maxDebitMinor");
-    if (amount > maxDebit) {
+    if (input.asset === "USDC" && amount > maxDebit) {
       throw new Error("amountMinor exceeds maxDebitMinor");
     }
 
@@ -332,9 +425,38 @@ export class CustodyTransferService {
       return this.reconcile(claimed.record);
     }
 
+    // What the user's balance is debited, in USDC base units. SOL is valued at the
+    // live price and must fit within the amount the user approved.
+    let debit = amount;
+    if (input.asset === "SOL") {
+      const refused = (reason: string, error: string) =>
+        this.saved({ ...claimed.record, status: "failed", reason, error, updatedAt: new Date().toISOString() });
+      let priceMicro: bigint;
+      try {
+        priceMicro = BigInt(Math.round((await (this.deps.solPrice ?? (() => solUsdcPrice(this.env)))()) * 1_000_000));
+      } catch (error) {
+        return refused("price_unavailable", (error as Error).message);
+      }
+      debit = (amount * priceMicro + 999_999_999n) / 1_000_000_000n;
+      if (debit > maxDebit) return refused("above_max_debit", `SOL worth ${debit} exceeds ${maxDebit}`);
+      let lamports: bigint;
+      try {
+        lamports = BigInt(await this.deps.connection.getBalance(ownerKey, this.deps.commitment));
+      } catch (error) {
+        return refused("chain_unavailable", (error as Error).message);
+      }
+      const left = lamports - amount;
+      if (left < 0n) return refused("insufficient_sol", `wallet holds ${lamports} lamports`);
+      if (left > 0n && left < RENT_EXEMPT_MIN_LAMPORTS) return refused("would_strand_rent", `would leave ${left} lamports`);
+      claimed.record = { ...claimed.record, debitMinor: debit.toString(), solPriceMicro: priceMicro.toString() };
+      await this.save(claimed.record);
+    } else {
+      claimed.record = { ...claimed.record, debitMinor: debit.toString() };
+    }
+
     try {
       // Axis Money checks the balance and records the debit atomically.
-      await this.reserve(ownerAddress, input, amount, digest);
+      await this.reserve(ownerAddress, input, debit, digest);
     } catch (error) {
       // "not debited" only when the ledger holds no debit for this request.
       const debit = await this.ledger.get(ownerAddress, input.idempotencyKey).catch(() => undefined);
@@ -365,39 +487,10 @@ export class CustodyTransferService {
             throw new Error("custody wallet identity mismatch");
           }
 
-          const sourceAta = getAssociatedTokenAddressSync(
-            this.deps.mint,
-            user.publicKey,
-          );
-          const destinationAta = getAssociatedTokenAddressSync(
-            this.deps.mint,
-            destination,
-            true,
-          );
-
           const tx = new Transaction();
           tx.feePayer = this.deps.operator.publicKey;
           tx.recentBlockhash = block.blockhash;
-
-          tx.add(
-            createAssociatedTokenAccountIdempotentInstruction(
-              this.deps.operator.publicKey,
-              destinationAta,
-              destination,
-              this.deps.mint,
-            ),
-          );
-
-          tx.add(
-            createTransferCheckedInstruction(
-              sourceAta,
-              this.deps.mint,
-              destinationAta,
-              user.publicKey,
-              amount,
-              6,
-            ),
-          );
+          tx.add(...this.instructions(input.asset, user.publicKey, destination, amount));
 
           tx.sign(this.deps.operator, user);
 
@@ -679,5 +772,13 @@ export function custodyTransferFromEnv(
     commitment: cfg.commitment,
     operator: loadOperator(env),
     env,
+    ...solPayoutFormFromEnv(env),
   });
+}
+
+function solPayoutFormFromEnv(env: NodeJS.ProcessEnv): { solPayoutForm?: SolPayoutForm } {
+  const form = env.AXIS_SOL_PAYOUT_FORM?.trim();
+  if (!form) return {};
+  if (form !== "native" && form !== "wrapped") throw new Error("AXIS_SOL_PAYOUT_FORM must be native or wrapped");
+  return { solPayoutForm: form };
 }
