@@ -1,114 +1,120 @@
-/**
- * Airtime fulfilment orchestration — the wiring that turns a request into a real
- * transaction: RESERVE the debit, DELIVER via VTpass, VOID the debit if delivery
- * hard-fails. Ordering follows the brief: reserve funds before delivering, and
- * never leave a charge standing for airtime that didn't go out. Idempotent on the
- * caller's key (a replay never double-charges or double-delivers).
- *
- * Pure of I/O: all effects are injected, so the money logic is unit-tested with
- * stubs. No model number anywhere — amounts are the user's, the rate is config.
- */
+import { createHash } from "crypto";
 import type { AirtimeResult } from "./vtpassClient";
-import type { SpendResult } from "./funding/spendLedger";
+import { requestIdForKey } from "./vtpassClient";
+import type { SpendRecord, SpendState } from "./funding/spendLedger";
+import type { MoneyLedger } from "./funding/moneyLedger";
 import { ngnToUsdcBase } from "./rate";
 
 export interface AirtimeFulfillDeps {
-  /** Resolve NGN per 1 USDC at buy time (Paj live rate, env fallback). */
   getRate: () => Promise<number>;
-  /** Axis markup over VTpass cost, in basis points (0 = charge cost only). */
   marginBps: number;
-  availableBaseUnits: (owner: string) => bigint;
-  spend: (
-    input: {
-      owner: string;
-      idempotencyKey: string;
-      paidBaseUnits: bigint;
-      costBaseUnits: bigint;
-      reason: string;
-    },
-    availableBaseUnits: bigint,
-  ) => SpendResult;
-  voidSpend: (owner: string, idempotencyKey: string) => boolean;
-  buyAirtime: (p: {
-    network: string;
-    amount: number;
-    phone: string;
-  }) => Promise<AirtimeResult>;
+  spend: MoneyLedger["spend"];
+  getSpend: MoneyLedger["get"];
+  findSpend: MoneyLedger["findByKey"];
+  setState: MoneyLedger["setState"];
+  voidUnknownKey: MoneyLedger["voidUnknownKey"];
+  buyAirtime: (p: { network: string; amount: number; phone: string; requestId: string }) => Promise<AirtimeResult>;
+  requery: (requestId: string) => Promise<AirtimeResult>;
 }
 
 export interface AirtimeFulfillParams {
   owner: string;
   network: string;
-  amount: number; // NGN face value
+  amount: number;
   phone: string;
   idempotencyKey: string;
 }
 
 export interface AirtimeFulfillResult {
-  status: "delivered" | "pending" | "failed" | "duplicate";
-  chargedBaseUnits?: string;
-  remnantBaseUnits?: string;
-  delivery?: AirtimeResult;
+  status: "delivered" | "pending" | "failed" | "in_doubt";
+  moneyState: SpendState;
+  chargedBaseUnits: string;
+  remnantBaseUnits: string;
+  requestId?: string;
+  reason?: string;
 }
 
-export async function fulfillAirtime(
-  deps: AirtimeFulfillDeps,
-  params: AirtimeFulfillParams,
-): Promise<AirtimeFulfillResult> {
-  const ngnPerUsdc = await deps.getRate();
-  const costBase = ngnToUsdcBase(params.amount, ngnPerUsdc);
-  const paidNgn = params.amount * (1 + deps.marginBps / 10000);
-  const paidBase = ngnToUsdcBase(paidNgn, ngnPerUsdc);
+export class AirtimeIdentityConflict extends Error {}
 
-  // 1) Reserve funds first (idempotent, balance-checked). Throws
-  //    InsufficientBalanceError if the owner can't cover it.
-  const available = deps.availableBaseUnits(params.owner);
-  const res = deps.spend(
-    {
-      owner: params.owner,
-      idempotencyKey: params.idempotencyKey,
-      paidBaseUnits: paidBase,
-      costBaseUnits: costBase,
-      reason: `airtime ${params.network} ${params.phone}`,
-    },
-    available,
-  );
-  if (res.duplicate) {
-    return {
-      status: "duplicate",
-      chargedBaseUnits: res.record.paidBaseUnits,
-      remnantBaseUnits: res.record.remnantBaseUnits,
-    };
+function providerId(record: SpendRecord): string | undefined {
+  // Legacy debits did not persist a reproducible provider identity. Never invent one.
+  return record.provider === "vtpass"
+    ? requestIdForKey(JSON.stringify([record.owner, record.idempotencyKey]), new Date(record.at))
+    : undefined;
+}
+
+function result(record: SpendRecord): AirtimeFulfillResult {
+  const state = record.state ?? "IN_DOUBT";
+  const released = state === "RELEASED" || state === "REVERSED";
+  return {
+    status: state === "SETTLED" ? "delivered" : released ? "failed" : state === "PENDING" ? "pending" : "in_doubt",
+    moneyState: state,
+    chargedBaseUnits: released ? "0" : record.paidBaseUnits,
+    remnantBaseUnits: state === "SETTLED" ? record.remnantBaseUnits : "0",
+    requestId: providerId(record),
+  };
+}
+
+async function apply(deps: AirtimeFulfillDeps, record: SpendRecord, delivery: AirtimeResult): Promise<AirtimeFulfillResult> {
+  let state: SpendState = "IN_DOUBT";
+  // Unknown/malformed/duplicate codes are not proof of failure or success.
+  const correlated = !delivery.requestId || delivery.requestId === providerId(record);
+  if (correlated) {
+    if (delivery.code === "000" && delivery.status === "delivered") state = "SETTLED";
+    else if (delivery.status === "failed" && delivery.code === "016") state = "RELEASED";
+    else if (delivery.status === "reversed" && delivery.code === "040") state = "REVERSED";
+    else if (["pending", "initiated"].includes(delivery.status)) state = "PENDING";
   }
+  return result(await deps.setState(record.owner, record.idempotencyKey, state));
+}
 
-  // 2) Deliver. A thrown error or a hard failure releases the reservation so the
-  //    user is never charged for airtime that didn't go out.
+/** Reserve once, persist the action timestamp before /pay, and never replay /pay.
+ * Retries return the stored verdict. Only status/requery reconciles uncertainty. */
+export async function fulfillAirtime(deps: AirtimeFulfillDeps, params: AirtimeFulfillParams): Promise<AirtimeFulfillResult> {
+  const fingerprint = createHash("sha256")
+    .update(JSON.stringify([params.owner, params.network.toLowerCase(), params.amount, params.phone])).digest("hex");
+  const replay = (record: SpendRecord): AirtimeFulfillResult => {
+    if (record.requestFingerprint && record.requestFingerprint !== fingerprint) {
+      throw new AirtimeIdentityConflict("idempotency key already belongs to another purchase");
+    }
+    return result(record);
+  };
+  const existing = await deps.getSpend(params.owner, params.idempotencyKey);
+  if (existing) return replay(existing); // works even when rate/balance/provider are down
+  const rate = await deps.getRate();
+  const cost = ngnToUsdcBase(params.amount, rate);
+  const paid = ngnToUsdcBase(params.amount * (1 + deps.marginBps / 10000), rate);
+  const reserved = await deps.spend({
+    owner: params.owner, idempotencyKey: params.idempotencyKey,
+    paidBaseUnits: paid, costBaseUnits: cost,
+    reason: `airtime ${params.network} ${params.phone}`,
+    provider: "vtpass", requestFingerprint: fingerprint,
+  });
+  if (reserved.duplicate) return replay(reserved.record);
+  const requestId = providerId(reserved.record)!;
   let delivery: AirtimeResult;
   try {
-    delivery = await deps.buyAirtime({
-      network: params.network,
-      amount: params.amount,
-      phone: params.phone,
-    });
-  } catch (err) {
-    deps.voidSpend(params.owner, params.idempotencyKey);
-    throw err;
+    delivery = await deps.buyAirtime({ network: params.network, amount: params.amount, phone: params.phone, requestId });
+  } catch {
+    return result((await deps.getSpend(params.owner, params.idempotencyKey))!); // initial IN_DOUBT debit stands
   }
+  return apply(deps, reserved.record, delivery);
+}
 
-  const accepted =
-    delivery.success ||
-    delivery.status === "pending" ||
-    delivery.status === "initiated";
-  if (!accepted) {
-    deps.voidSpend(params.owner, params.idempotencyKey);
-    return { status: "failed", delivery };
+/** The service-token gate is at the HTTP boundary. No requery can create a debit. */
+export async function requeryAirtime(deps: AirtimeFulfillDeps, key: string): Promise<AirtimeFulfillResult | null> {
+  // A key never seen here is voided so a late request cannot debit under it.
+  const record = await deps.voidUnknownKey(key, "not_submitted");
+  if (!record) return { status: "failed", moneyState: "RELEASED", chargedBaseUnits: "0", remnantBaseUnits: "0", reason: "not_submitted" };
+  if (["SETTLED", "RELEASED", "REVERSED"].includes(record.state ?? "")) return result(record);
+  const requestId = providerId(record);
+  if (!requestId) return result(record);
+  let delivery: AirtimeResult;
+  try {
+    delivery = await deps.requery(requestId);
+  } catch {
+    return result(await deps.setState(record.owner, key, "IN_DOUBT"));
   }
-
-  // 3) Delivered or pending: the charge stands; remnant is pool gain.
-  return {
-    status: delivery.success ? "delivered" : "pending",
-    chargedBaseUnits: paidBase.toString(),
-    remnantBaseUnits: (paidBase - costBase).toString(),
-    delivery,
-  };
+  if (delivery.requestId !== requestId) return result(await deps.setState(record.owner, key, "IN_DOUBT"));
+  return apply(deps, record, delivery);
 }

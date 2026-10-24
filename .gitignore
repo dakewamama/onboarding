@@ -5,3 +5,14 @@ node_modules
 test-ledger
 **/*.rs.bk
 payments/dist/
+
+# Local money stores: never commit
+.funding-store/
+payments/.funding-store/
+payments/.paj-store/
+
+# Local secrets: never commit
+.env
+.env.*
+!.env.example
+!**/.env.example

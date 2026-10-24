@@ -18,12 +18,6 @@ export interface FundingConfig {
   pageSize: number;
   /** Durable store directory (gitignored). Deposits survive restarts here. */
   storeDir: string;
-  /**
-   * Browser origins allowed to call /funding/* cross-origin (the Vercel frontend
-   * calling the Railway backend). ["*"] allows any; [] disables CORS (same-origin
-   * / server-to-server only). From env, never committed.
-   */
-  corsOrigins: string[];
 }
 
 // Real mainnet USDC (6 decimals). Same constant the Paj module pins.
@@ -66,9 +60,5 @@ export function loadFundingConfig(
       : 60000,
     pageSize: env.FUNDING_PAGE_SIZE ? Number(env.FUNDING_PAGE_SIZE) : 10,
     storeDir: fundingStoreDir(env),
-    corsOrigins: (env.FUNDING_CORS_ORIGINS ?? "")
-      .split(",")
-      .map((o) => o.trim())
-      .filter(Boolean),
   };
 }

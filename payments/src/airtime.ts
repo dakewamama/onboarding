@@ -1,14 +1,14 @@
 import * as http from "http";
+import { bearerAuthorized, readJson, send } from "./httpUtil";
 import { URL } from "url";
-import { timingSafeEqual } from "crypto";
-import { VtpassClient, VtpassEnv } from "./vtpassClient";
-import { DepositLedger } from "./funding/depositLedger";
-import { SpendLedger, InsufficientBalanceError } from "./funding/spendLedger";
+import { VtpassClient, VtpassEnv, serviceIdFor } from "./vtpassClient";
+import { InsufficientBalanceError } from "./funding/spendLedger";
+import { openMoneyLedger, SpendKeyVoidedError } from "./funding/moneyLedger";
 import { fundingStoreDir } from "./funding/config";
 import { usdcToNgnRate, offRampNgnPerUsdc } from "./rate";
-import { fulfillAirtime, AirtimeFulfillDeps } from "./airtimeFulfill";
-import { IdentityStore } from "./identity";
-import { provisionWallet } from "./custody";
+import { fulfillAirtime, requeryAirtime, AirtimeIdentityConflict, AirtimeFulfillDeps } from "./airtimeFulfill";
+import { openWalletAccounts, WalletConflict } from "./accounts";
+import { PublicKey } from "@solana/web3.js";
 import { PajClient } from "./pajClient";
 import type { Currency } from "./types";
 
@@ -19,9 +19,9 @@ import type { Currency } from "./types";
  * the public URL can't.
  *
  * It RESERVES the debit (SpendLedger, balance-checked + idempotent), DELIVERS via
- * VTpass, and VOIDS the debit if delivery hard-fails — so a user is never charged
- * for airtime that didn't go out. The remnant (paid − cost) is booked as pool
- * gain. Fail-closed: missing VTpass keys, token, or rate => 503.
+ * VTpass, and releases the debit only on confirmed failure. The remnant is
+ * booked as pool gain only once settled. Unknown results retain the debit as
+ * IN_DOUBT. Missing VTpass keys, token, or rate prevents new purchases.
  */
 export interface AirtimeMount {
   handle(req: http.IncomingMessage, res: http.ServerResponse): Promise<boolean>;
@@ -81,34 +81,28 @@ export function mountAirtime(
         : "";
 
   const storeDir = fundingStoreDir(env);
-  const deposits = new DepositLedger(storeDir);
-  const spends = new SpendLedger(storeDir);
-  const identity = new IdentityStore(storeDir);
+  const ledger = openMoneyLedger(env, storeDir);
+  const accounts = openWalletAccounts(ledger, storeDir, env);
   const deps: AirtimeFulfillDeps = {
     getRate,
     marginBps,
-    availableBaseUnits: (owner) =>
-      deposits.balanceBaseUnits(owner) - spends.spentBaseUnits(owner),
-    spend: (input, avail) => spends.spend(input, avail),
-    voidSpend: (owner, key) => spends.void(owner, key),
+    spend: input => ledger.spend(input),
+    getSpend: (owner, key) => ledger.get(owner, key),
+    findSpend: key => ledger.findByKey(key),
+    voidUnknownKey: (key, reason) => ledger.voidUnknownKey(key, reason),
+    setState: (owner, key, state) => ledger.setState(owner, key, state),
+    requery: requestId => client!.requery(requestId),
     buyAirtime: (p) => client!.buyAirtime(p),
   };
 
-  function authorized(req: http.IncomingMessage): boolean {
-    const header = req.headers.authorization ?? "";
-    const provided = header.startsWith("Bearer ") ? header.slice(7) : "";
-    if (!token || !provided) return false;
-    const a = Buffer.from(provided);
-    const b = Buffer.from(token);
-    return a.length === b.length && timingSafeEqual(a, b);
-  }
+  const authorized = (req: http.IncomingMessage) => bearerAuthorized(req, token);
 
   async function handle(
     req: http.IncomingMessage,
     res: http.ServerResponse,
   ): Promise<boolean> {
     const url = new URL(req.url ?? "/", "http://localhost");
-    const routes = ["/airtime", "/airtime/link", "/airtime/provision", "/airtime/rate", "/wallet", "/wallet/balance"];
+    const routes = ["/airtime/status", "/airtime", "/airtime/link", "/airtime/provision", "/airtime/rate", "/wallet", "/wallet/balance", "/wallet/activity"];
     if (!routes.includes(url.pathname)) return false;
 
     // Token gates everything. The VTpass/rate `enabled` gate applies only to the
@@ -116,15 +110,59 @@ export function mountAirtime(
     if (!token) return void send(res, 503, { error: "INTERNAL_API_TOKEN not set" }), true;
     if (!authorized(req)) return void send(res, 401, { error: "unauthorized" }), true;
 
+    if (url.pathname === "/airtime/status") {
+      if (req.method !== "GET") return void send(res, 405, { error: "method" }), true;
+      const key = url.searchParams.get("idempotencyKey");
+      if (!key) return void send(res, 400, { error: "idempotencyKey required" }), true;
+      try {
+        const verdict = await requeryAirtime(deps, key);
+        if (!verdict) return void send(res, 202, { status: "in_doubt", moneyState: "IN_DOUBT" }), true;
+        if (verdict.status === "failed" && verdict.reason === "not_submitted") return void send(res, 200, verdict), true;
+        return void send(res, verdict.status === "in_doubt" || verdict.status === "pending" ? 202 : 200, verdict), true;
+      } catch {
+        return void send(res, 202, { status: "in_doubt", moneyState: "IN_DOUBT" }), true;
+      }
+    }
+
+    // The wallet's own record: credited deposits and debits, newest first.
+    // GET ?userId=... — no wallet yet => empty lists, not an error.
+    if (url.pathname === "/wallet/activity") {
+      const userId = url.searchParams.get("userId") ?? "";
+      if (!userId) return void send(res, 400, { error: "userId required" }), true;
+      const address = await accounts.addressFor(userId);
+      if (!address) return void send(res, 200, { deposits: [], debits: [] }), true;
+      const [deposits, spends] = await Promise.all([ledger.deposits(address), ledger.spends(address, 100)]);
+      send(res, 200, {
+        address,
+        deposits: deposits.slice(0, 100).map((d) => ({
+          id: d.signature,
+          // The on-chain transaction, without the ":sol" suffix SOL credits are keyed by.
+          signature: d.signature.replace(/:sol$/, ""),
+          asset: d.asset === "sol" ? "SOL" : "USDC",
+          usdcMinor: d.baseUnits,
+          ...(d.lamports ? { lamports: d.lamports } : {}),
+          at: d.at,
+        })),
+        debits: spends.map((s) => ({
+          key: s.idempotencyKey,
+          usdcMinor: s.paidBaseUnits,
+          reason: s.reason,
+          state: s.state ?? "SETTLED",
+          at: s.at,
+        })),
+      });
+      return true;
+    }
+
     // Spendable balance for a user (deposits minus spends), with an NGN estimate.
     // GET ?userId=... — resolves the user's wallet, sums the ledgers. No wallet or
     // no deposits => 0, not an error.
     if (url.pathname === "/wallet/balance") {
       const userId = url.searchParams.get("userId") ?? "";
       if (!userId) return void send(res, 400, { error: "userId required" }), true;
-      const address = identity.addressFor(userId);
+      const address = await accounts.addressFor(userId);
       const base = address
-        ? deposits.balanceBaseUnits(address) - spends.spentBaseUnits(address)
+        ? await ledger.availableBaseUnits(address)
         : BigInt(0);
       const usdc = Number(base) / 1e6;
       let ngn: number | null = null;
@@ -150,73 +188,81 @@ export function mountAirtime(
 
     if (req.method !== "POST") return void send(res, 405, { error: "method" }), true;
 
+    let buyKey = "";
     try {
-      const body = await readJson(req);
+      let body: Record<string, unknown>;
+      try {
+        body = await readJson(req);
+      } catch {
+        return void send(res, 400, { error: "invalid JSON" }), true;
+      }
 
-      // THE user's wallet: create it once (idempotent), link userId <-> address,
-      // and arm the deposit watch so any USDC sent to it is credited. This is what
-      // auth calls — one wallet per user, billed for everything. (/airtime/provision
-      // is a legacy alias for the same thing.) Needs only KEYSTORE_MASTER_KEY.
+      // THE user's wallet: created once, and the deposit watch armed so anything
+      // sent to it is credited. One wallet per user, used for everything.
+      // (/airtime/provision is a legacy alias.) Needs KEYSTORE_MASTER_KEY.
       if (url.pathname === "/wallet" || url.pathname === "/airtime/provision") {
         const userId = String(body.userId ?? "");
         if (!userId) return void send(res, 400, { error: "userId is required" }), true;
         let wallet: { userId: string; address: string; created: boolean };
         try {
-          wallet = provisionWallet(storeDir, userId, env);
+          wallet = await accounts.provision(userId);
         } catch (e) {
-          return void send(res, 503, { error: (e as Error).message }), true;
+          return void send(res, e instanceof WalletConflict ? 409 : 503, { error: (e as Error).message }), true;
         }
-        identity.link(userId, wallet.address);
         try {
           armWatch?.(wallet.address); // credit deposits to this wallet automatically
-        } catch {
-          // watch arming is best-effort; balance still reconciles once armed
+        } catch (e) {
+          // The balance still reconciles once the watch is armed on a later call.
+          console.warn("[wallet] could not arm deposit watch:", (e as Error).message);
         }
         return void send(res, 200, wallet), true;
       }
 
-      // Link a userId to an externally-provided wallet address (manual path).
+      // Link a userId to an externally-held wallet (manual path). A user with an
+      // Axis custodial wallet stays on it: their balance is keyed by that address.
       if (url.pathname === "/airtime/link") {
         const userId = String(body.userId ?? "");
         const address = String(body.address ?? "");
         if (!userId || !address) {
           return void send(res, 400, { error: "userId and address are required" }), true;
         }
-        identity.link(userId, address);
+        try {
+          new PublicKey(address);
+        } catch {
+          return void send(res, 400, { error: "address is not a Solana public key" }), true;
+        }
+        try {
+          await accounts.linkExternal(userId, address);
+        } catch (e) {
+          if (e instanceof WalletConflict) return void send(res, 409, { error: e.message }), true;
+          throw e;
+        }
         return void send(res, 200, { userId, address }), true;
       }
 
       // From here on it's the buy route, which needs VTpass + rate configured.
-      if (!enabled) return void send(res, 503, { error: disabledReason }), true;
       const rawOwner = String(body.owner ?? "");
       const network = String(body.network ?? "");
       const phone = String(body.phone ?? "");
       const idempotencyKey = String(body.idempotencyKey ?? "");
+      buyKey = idempotencyKey;
+      if (!enabled) return void (await rejectBeforeDebit(res, idempotencyKey, 503, "not_debited", disabledReason)), true;
       const amount = body.amount != null ? Number(body.amount) : NaN;
-      if (!rawOwner || !network || !phone || !idempotencyKey || !(amount > 0)) {
-        return (
-          void send(res, 400, {
-            error:
-              "owner, network, phone, idempotencyKey and a positive amount are required",
-          }),
-          true
-        );
+      if (!rawOwner || !network || !phone || !idempotencyKey || !Number.isFinite(amount) || !(amount > 0) || !serviceIdFor(network)) {
+        return void (await rejectBeforeDebit(res, idempotencyKey, 400, "invalid_request",
+          "owner, network, phone, idempotencyKey and a positive amount are required")), true;
       }
       // Resolve to the single money key: the custodial wallet address deposits are
       // credited under. rawOwner is normally a userId; accept a linked address too.
       let owner: string;
-      const mapped = identity.addressFor(rawOwner);
+      const mapped = await accounts.addressFor(rawOwner);
       if (mapped) {
         owner = mapped; // rawOwner was a userId
-      } else if (identity.userFor(rawOwner)) {
+      } else if (await accounts.userFor(rawOwner)) {
         owner = rawOwner; // rawOwner was already the linked address
       } else {
-        return (
-          void send(res, 409, {
-            error: "no wallet linked for this user; call /airtime/link first",
-          }),
-          true
-        );
+        return void (await rejectBeforeDebit(res, idempotencyKey, 409, "no_wallet",
+          "no wallet linked for this user; call /airtime/link first")), true;
       }
       const result = await fulfillAirtime(deps, {
         owner,
@@ -226,20 +272,41 @@ export function mountAirtime(
         idempotencyKey,
       });
       const status =
-        result.status === "delivered" || result.status === "duplicate"
+        result.status === "delivered"
           ? 200
-          : result.status === "pending"
+          : (result.status === "pending" || result.status === "in_doubt")
             ? 202
             : 502; // failed
       return void send(res, status, result), true;
     } catch (err) {
+      if (err instanceof AirtimeIdentityConflict) return void send(res, 409, { error: err.message }), true;
       if (err instanceof InsufficientBalanceError) {
-        return void send(res, 402, { error: "insufficient balance" }), true;
+        return void send(res, 402, { error: "insufficient balance", status: "failed", moneyState: "RELEASED", reason: "insufficient_balance" }), true;
+      }
+      if (err instanceof SpendKeyVoidedError) {
+        return void send(res, 409, { status: "failed", moneyState: "RELEASED", reason: "voided" }), true;
       }
       // Never leak the key; surface a generic error.
       console.error("[airtime] error", (err as Error).message);
-      return void send(res, 502, { error: "airtime delivery failed" }), true;
+      if (buyKey) {
+        try { return void (await rejectBeforeDebit(res, buyKey, 503, "not_debited", "airtime unavailable")), true; }
+        catch { /* the ledger itself is unreachable: the outcome stays unknown */ }
+      }
+      return void send(res, 202, { status: "in_doubt", moneyState: "IN_DOUBT" }), true;
     }
+  }
+
+  /**
+   * A purchase refused before any debit. Void the key so no later request can
+   * debit under it, then answer definitively. If a debit somehow exists, report it.
+   */
+  async function rejectBeforeDebit(res: http.ServerResponse, key: string, code: number, reason: string, error: string): Promise<void> {
+    const existing = key ? await ledger.voidUnknownKey(key, reason) : null;
+    if (existing) {
+      const verdict = await requeryAirtime(deps, key);
+      return send(res, verdict && verdict.status !== "in_doubt" && verdict.status !== "pending" ? 200 : 202, verdict ?? { status: "in_doubt", moneyState: "IN_DOUBT" });
+    }
+    send(res, code, { error, status: "failed", moneyState: "RELEASED", reason });
   }
 
   function logStatus(_port: number): void {
@@ -251,16 +318,4 @@ export function mountAirtime(
   }
 
   return { handle, logStatus };
-}
-
-async function readJson(req: http.IncomingMessage): Promise<Record<string, unknown>> {
-  const chunks: Buffer[] = [];
-  for await (const c of req) chunks.push(c as Buffer);
-  const raw = Buffer.concat(chunks).toString("utf8");
-  return raw ? (JSON.parse(raw) as Record<string, unknown>) : {};
-}
-
-function send(res: http.ServerResponse, status: number, body: unknown): void {
-  res.writeHead(status, { "content-type": "application/json" });
-  res.end(JSON.stringify(body));
 }

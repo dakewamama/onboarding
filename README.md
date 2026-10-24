@@ -123,3 +123,12 @@ The wallet needs a little devnet SOL (`solana airdrop 2`).
 ## License
 
 MIT. See [LICENSE](LICENSE).
+
+## Payments adapter validation
+
+The internal airtime adapter preserves ambiguous debits for reconciliation and
+uses a stable provider request identity across retries. See
+[payments setup, safety limits, and status API](payments/README.md#airtime-ambiguity-and-reconciliation).
+Run `npm run typecheck:payments`, `npm run typecheck:offline`, and
+`npm run test:offline` for credential-free payments/server checks. `npm test`
+still includes the Anchor integration suite and requires its validator and wallet.

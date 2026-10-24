@@ -96,24 +96,65 @@ that's fine. For real settlement correlation, attach a Railway volume and point
 
 ## Crypto funding (USDC on Solana) + persistent volume
 
-The same service also serves the additive USDC-funding routes (`/funding/*`) when
-`SOLANA_RPC_URL` is set (otherwise inert; Paj runs unchanged). Env: `SOLANA_RPC_URL`,
-`SOLANA_USDC_MINT`, `SOLANA_COMMITMENT`, `FUNDING_CORS_ORIGINS` (the browser
-frontend's origin).
+The same service serves the USDC-funding routes (`/funding/*`) when
+`SOLANA_RPC_URL` is set (otherwise they return 503). They are server-to-server
+only and need the `INTERNAL_API_TOKEN` bearer. Env: `SOLANA_RPC_URL`,
+`SOLANA_USDC_MINT`, `SOLANA_COMMITMENT`.
 
-The funding **deposit ledger is money** — it's what makes crediting idempotent on
-the tx signature and remembers deposits across restarts. It must survive redeploys,
-not just process restarts. The image defaults `FUNDING_STORE_DIR=/data` and marks
-`/data` a `VOLUME`, so:
+The wallet routes (also `INTERNAL_API_TOKEN`-bearer) back the Axis wallet:
+`GET /wallet` provisions/returns the user's custodial address, `GET /wallet/balance`
+the spendable USDC, `GET /wallet/holdings` both USDC and SOL (so a payout can be
+funded in whichever the wallet holds), and `GET /wallet/activity` the wallet's
+deposits and debits. Custody transfers pay out in USDC, or in native SOL when the
+wallet is short on USDC and SOL payouts are enabled, always within the approved
+USDC maximum.
 
-1. In the Railway service, add a **Volume** with mount path **`/data`**.
-2. Leave `FUNDING_STORE_DIR` unset (image default `/data`), or set it to your mount
-   path if different.
+Balances, spends and deposits live in **Axis Money**, a double-entry ledger in
+Postgres (`payments/src/funding/moneyLedger.ts`). Set `DATABASE_URL`; the image runs
+with `NODE_ENV=production` and refuses to start without it. Every movement is an
+immutable, balanced transaction keyed by its identity (deposit signature, spend
+idempotency key), so retries and duplicate chain observations cannot post twice.
+Spends check and reserve the balance under a per-owner transaction lock, so
+concurrent requests from any number of instances cannot overdraw.
 
-Without a mounted volume, `/data` is still just ephemeral container disk and a
-redeploy can lose or re-credit real deposits. Attach the volume before mainnet, or
-swap the file store for a DB (the atomic `wx`-per-signature contract maps directly
-to a `UNIQUE` constraint on the signature).
+Migrating from the old file ledger: point `FUNDING_STORE_DIR` at the old store
+(the `/data` volume) and run `yarn money-import` once with `DATABASE_URL` set. It is
+idempotent, keeps each spend's original timestamp and state, and exits with code 2
+if any owner would be left negative.
+
+Custody-transfer records live in Postgres too (`custody_transfers`), and every
+update after the first claim is a compare-and-set, so a status reconcile and an
+in-progress transfer can never both win. `yarn money-import` copies existing
+transfer files as well.
+
+Wallets live in Postgres too (`wallet_accounts`): one row per user and per
+address, holding either an Axis custodial wallet (its key wrapped with
+`KEYSTORE_MASTER_KEY`) or an external wallet the user linked. Balances, airtime
+and custody transfers all resolve a user through it. `yarn money-import` copies
+existing wallet files, matching each key to its exact owner, and exits with code
+2 if any key file's owner cannot be established. The `/data` volume now only
+holds the deposit watchlist and scan cursors.
+
+### Definitive failures (no money moved)
+
+Responses carry `moneyState`. `status:"failed"` with `moneyState:"RELEASED"` means
+nothing left the user's balance, and comes with a `reason`:
+
+- `not_debited` / `invalid_request` / `no_wallet` / `insufficient_balance`: the
+  request was refused before any debit.
+- `not_submitted`: a status check for a key this service never saw. The key is
+  voided first, so a late request carrying it is refused (`409`, `voided`) and can
+  never debit.
+- `not_broadcast`: a custody transfer claimed but never signed (for example, a
+  crash) and abandoned after two minutes. Its signature can no longer be stored,
+  so it can never be broadcast afterwards.
+- `expired`: the finalized chain passed the transaction's last valid block height
+  and its signature is unknown, so it can never land.
+
+`failed` + `REVERSED` means the transaction landed with an error. Anything else
+uncertain stays `IN_DOUBT` and is reconciled under its original identity.
+
+Validate the ledger against a disposable database: `TEST_DATABASE_URL=... yarn test:money`.
 
 ## Gotchas baked in (from v1 experience, verified against v2)
 
@@ -130,3 +171,55 @@ to a `UNIQUE` constraint on the signature).
 ## Still open (ask support@paj.cash)
 
 Fee schedule, rate limits, and whether a private status-fetch endpoint exists.
+
+## Airtime ambiguity and reconciliation
+
+`POST /airtime` and `GET /airtime/status?idempotencyKey=...` require the existing
+`INTERNAL_API_TOKEN` bearer token. These are internal service endpoints, not
+user-facing grants. Status lookup does not require a conversion rate.
+
+Each purchase records its owner, stable Axis action key, parameter fingerprint,
+creation timestamp, and `IN_DOUBT` debit before contacting VTpass. The provider ID
+is derived from that key/owner and the persisted timestamp, never the retry clock.
+This preserves VTpass's [Lagos timestamp prefix requirement](https://vtpass.com/documentation/how-to-generate-request-id/).
+A repeated purchase request returns its recorded state; it never submits another
+`/pay`. Reusing the key with changed purchase parameters returns HTTP 409.
+
+Timeouts, malformed responses, unknown statuses and duplicate-provider-ID responses
+retain the debit. `in_doubt` and `pending` return HTTP 202, not ordinary failure.
+The status endpoint calls VTpass's [POST /requery](https://vtpass.com/documentation/re-query-services/)
+with the original request ID. A correlated delivered verdict settles the debit;
+a confirmed failed verdict releases it; a confirmed reversed verdict reverses it.
+Unknown/missing/mismatched requery responses remain `IN_DOUBT`. The response has
+`status` (`delivered`, `pending`, `failed`, `in_doubt`) and `moneyState`
+(`SETTLED`, `PENDING`, `RELEASED`, `REVERSED`, `IN_DOUBT`). Unknown local keys also
+return HTTP 202: absence of a local receipt is not evidence of provider failure.
+
+Released/reversed records are retained as idempotency tombstones and excluded
+from the debit total. Pending/unknown debits are excluded from settled pool gain.
+Legacy filenames remain readable; new keys use SHA-256 filenames to prevent
+punctuation collisions. No bulk data migration is needed. Legacy airtime records
+without a reproducible provider ID remain in doubt and require manual
+reconciliation; the service neither invents an ID nor resubmits them.
+
+Scope and limits: this patch uses the existing file ledger and supports a single
+service process with a persistent funding-store directory. It does not establish
+multi-process transactional accounting or replace the ledger with a database.
+A crash after reservation but before submission can leave funds in doubt; only
+an authoritative verdict/manual reconciliation can release them. No timer or new
+workflow engine is added. The caller drives status polling. Provider transport
+has a 30-second timeout. Automated tests use explicit provider doubles; no live
+VTpass purchase was made. This remains a draft, not production certification.
+
+Validation without production credentials:
+
+```sh
+npm run typecheck:payments
+npm run typecheck:offline
+npm run test:offline
+```
+
+`npm test` retains the full Anchor suite and requires the configured validator,
+program artifacts, `ANCHOR_PROVIDER_URL`, and test wallet. The root tsconfig also
+includes the separate client project; use its own configuration/dependencies for
+client validation. No new environment variables are required by this patch.

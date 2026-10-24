@@ -25,6 +25,25 @@ describe("IdentityStore (userId <-> custodial wallet)", () => {
     assert.doesNotThrow(() => id.link("u", "addrA")); // same pair is fine
     assert.throws(() => id.link("u", "addrB"), /different wallet/);
   });
+
+  it("keeps ids that differ only in punctuation apart, and an address has one user", () => {
+    const id = new IdentityStore(tmp());
+    id.link("web:1", "addrA");
+    assert.isNull(id.addressFor("web_1"));
+    assert.throws(() => id.link("web_1", "addrA"), /different user/);
+    id.link("web_1", "addrB");
+    assert.equal(id.addressFor("web:1"), "addrA");
+    assert.equal(id.addressFor("web_1"), "addrB");
+  });
+
+  it("reads a pre-hash link only for its exact owner", () => {
+    const dir = tmp();
+    const id = new IdentityStore(dir);
+    fs.writeFileSync(path.join(dir, "identity", "by-user", "web_1.txt"), "addrL");
+    fs.writeFileSync(path.join(dir, "identity", "by-address", "addrL.txt"), "web:1");
+    assert.isNull(id.addressFor("web_1"));
+    assert.equal(id.addressFor("web:1"), "addrL");
+  });
 });
 
 describe("balance reconciliation (the fix)", () => {

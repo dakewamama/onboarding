@@ -19,7 +19,7 @@ RUN apt-get update \
   && npm init -y >/dev/null 2>&1 \
   && npm install --no-audit --no-fund \
       typescript@5 @types/node@20 \
-      @solana/web3.js@1 @solana/spl-token@0.4 \
+      @solana/web3.js@1 @solana/spl-token@0.4 pg@8.23.0 @types/pg@8.23.1 \
   && apt-get purge -y python3 make g++ \
   && apt-get autoremove -y \
   && rm -rf /var/lib/apt/lists/*
@@ -44,5 +44,9 @@ EXPOSE 8080
 # NOTE: no Dockerfile VOLUME instruction here — Railway's builder rejects it
 # ("use Railway Volumes" instead); the mount is configured on the service.
 ENV FUNDING_STORE_DIR=/data
+
+# Axis Money (balances, spends, deposits) lives in Postgres. In production the
+# service refuses to start without DATABASE_URL rather than fall back to files.
+ENV NODE_ENV=production
 
 CMD ["node", "payments/dist/server.js"]

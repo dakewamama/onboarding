@@ -17,15 +17,23 @@ import * as path from "path";
  */
 
 export interface CreditRecord {
-  /** Solana transaction signature — the idempotency key. */
+  /** Idempotency key. For USDC this is the tx signature; for SOL it's
+   *  `<signature>:sol` so one tx carrying both assets can't collide. */
   signature: string;
-  /** The Axis wallet (owner) that received the USDC. */
+  /** The Axis wallet (owner) that received the deposit. */
   owner: string;
-  /** Integer USDC base units (6 dp). Stored as a string; never a float. */
+  /** Integer USDC base units (6 dp). Stored as a string; never a float. For a
+   *  SOL deposit this is the USDC-equivalent valued at `priceUsdcPerSol`. */
   baseUnits: string;
   /** RPC commitment the deposit had reached when credited. */
   commitment: string;
   at: string;
+  /** "usdc" (default when absent) or "sol". */
+  asset?: "usdc" | "sol";
+  /** For SOL deposits: the raw lamports received (audit trail). */
+  lamports?: string;
+  /** For SOL deposits: the SOL->USDC price used to value it (audit trail). */
+  priceUsdcPerSol?: number;
 }
 
 export class DepositLedger {

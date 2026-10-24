@@ -11,7 +11,7 @@
  */
 import { Connection } from "@solana/web3.js";
 import { loadFundingConfig } from "./config";
-import { DepositLedger } from "./depositLedger";
+import { openMoneyLedger } from "./moneyLedger";
 import { UsdcWatcher } from "./usdcWatcher";
 import { fromBaseUnits } from "../money";
 
@@ -32,7 +32,7 @@ async function main() {
     return;
   }
 
-  const ledger = new DepositLedger(cfg.storeDir);
+  const ledger = openMoneyLedger(process.env, cfg.storeDir);
   const credited: string[] = [];
   const watcher = new UsdcWatcher(cfg, ledger, (r) => {
     credited.push(`${fromBaseUnits(BigInt(r.baseUnits))} USDC  ${r.signature}`);
@@ -45,7 +45,7 @@ async function main() {
   watcher.watch(owner);
   await watcher.scanOwner(owner);
 
-  console.log(`\nbalance    ${fromBaseUnits(ledger.balanceBaseUnits(owner))} USDC (durably credited)`);
+  console.log(`\nbalance    ${fromBaseUnits(await ledger.availableBaseUnits(owner))} USDC (spendable)`);
   console.log(`new credits this scan: ${credited.length}`);
   for (const c of credited) console.log(`  + ${c}`);
 }

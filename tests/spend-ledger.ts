@@ -90,3 +90,42 @@ describe("SpendLedger (the debit path)", () => {
     assert.equal(reopened.poolGainBaseUnits().toString(), "10");
   });
 });
+
+describe("SpendLedger reconciliation persistence", () => {
+  it("retains released identities across reopen and never debits the same action again", () => {
+    const { ledger, dir } = tmpLedger();
+    const input = { owner: "w", idempotencyKey: "action:1", paidBaseUnits: u(100), costBaseUnits: u(90), reason: "airtime", provider: "vtpass" as const };
+    ledger.spend(input, u(100));
+    ledger.setState("w", input.idempotencyKey, "RELEASED");
+    const reopened = new SpendLedger(dir);
+    assert.isTrue(reopened.spend(input, u(100)).duplicate);
+    assert.equal(reopened.spentBaseUnits("w").toString(), "0");
+    assert.equal(reopened.records("w").length, 1);
+  });
+
+  it("stale unknown/pending results cannot undo settlement or release", () => {
+    const { ledger } = tmpLedger();
+    for (const state of ["SETTLED", "RELEASED"] as const) {
+      ledger.spend({ owner: "w", idempotencyKey: state, paidBaseUnits: u(10), costBaseUnits: u(9), reason: "test", provider: "vtpass" }, u(100));
+      ledger.setState("w", state, state);
+      assert.equal(ledger.setState("w", state, "IN_DOUBT").state, state);
+      assert.equal(ledger.setState("w", state, "PENDING").state, state);
+    }
+  });
+
+  it("does not collapse distinct action keys containing punctuation", () => {
+    const { ledger } = tmpLedger();
+    for (const key of ["action:1", "action/1"]) {
+      ledger.spend({ owner: "w", idempotencyKey: key, paidBaseUnits: u(10), costBaseUnits: u(10), reason: "test" }, u(100));
+    }
+    assert.equal(ledger.records("w").length, 2);
+  });
+
+  it("reads legacy debit filenames without treating them as new purchases", () => {
+    const { ledger, dir } = tmpLedger();
+    fs.mkdirSync(path.join(dir, "spent", "w"), { recursive: true });
+    fs.writeFileSync(path.join(dir, "spent", "w", "old_key.json"), JSON.stringify({ owner: "w", idempotencyKey: "old:key", paidBaseUnits: "10", costBaseUnits: "10", remnantBaseUnits: "0", reason: "legacy", at: "2026-01-01T00:00:00Z" }));
+    assert.isTrue(ledger.hasSpent("w", "old:key"));
+    assert.equal(ledger.get("w", "old:key")?.paidBaseUnits, "10");
+  });
+});

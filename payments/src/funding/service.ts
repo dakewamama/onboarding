@@ -1,8 +1,10 @@
 import { Connection } from "@solana/web3.js";
 import { fromBaseUnits, toBaseUnits } from "../money";
 import { FundingConfig, loadFundingConfig } from "./config";
-import { DepositLedger, CreditRecord } from "./depositLedger";
+import type { CreditRecord } from "./depositLedger";
+import { openMoneyLedger, type MoneyLedger } from "./moneyLedger";
 import { UsdcWatcher } from "./usdcWatcher";
+import { SolWatcher } from "./solWatcher";
 import { TransferBuilder, BuiltTransfer } from "./transferBuilder";
 
 export interface DepositAddress {
@@ -25,8 +27,9 @@ export interface DepositAddress {
  */
 export class FundingService {
   readonly config: FundingConfig;
-  readonly ledger: DepositLedger;
+  readonly ledger: MoneyLedger;
   readonly watcher: UsdcWatcher;
+  readonly solWatcher: SolWatcher;
   readonly builder: TransferBuilder;
 
   constructor(
@@ -34,15 +37,19 @@ export class FundingService {
     onCredit: (r: CreditRecord) => void | Promise<void> = defaultLog
   ) {
     this.config = config;
-    this.ledger = new DepositLedger(config.storeDir);
+    this.ledger = openMoneyLedger(process.env, config.storeDir);
     const connection = new Connection(config.rpcUrl, config.commitment);
     this.watcher = new UsdcWatcher(config, this.ledger, onCredit, connection);
+    // Native SOL is accepted too (so users have gas for outbound Paj transfers
+    // until a fee-payer relayer exists). Shares the ledger, watchlist, and RPC.
+    this.solWatcher = new SolWatcher(config, this.ledger, onCredit, connection);
     this.builder = new TransferBuilder(config, connection);
   }
 
-  /** Start the background deposit watcher. */
+  /** Start the background deposit watchers (USDC + SOL). */
   start(): void {
     this.watcher.start();
+    this.solWatcher.start();
   }
 
   /** Arm the deposit watch for a wallet so any USDC sent to it gets credited.
@@ -53,6 +60,7 @@ export class FundingService {
 
   stop(): void {
     this.watcher.stop();
+    this.solWatcher.stop();
   }
 
   /**
@@ -87,15 +95,15 @@ export class FundingService {
     return this.builder.build(fromWallet, owner, amountUsdc);
   }
 
-  /** Durably-credited balance for a user, as a canonical decimal USDC string. */
-  balance(owner: string): { owner: string; usdc: string; baseUnits: string } {
-    const base = this.ledger.balanceBaseUnits(owner);
+  /** Spendable Axis Money balance (deposits minus active spends), decimal USDC. */
+  async balance(owner: string): Promise<{ owner: string; usdc: string; baseUnits: string }> {
+    const base = await this.ledger.availableBaseUnits(owner);
     return { owner, usdc: fromBaseUnits(base), baseUnits: base.toString() };
   }
 
   /** Credited deposits for a user, decimal amounts, newest first. */
-  deposits(owner: string): Array<{ signature: string; usdc: string; at: string }> {
-    return this.ledger.deposits(owner).map((d) => ({
+  async deposits(owner: string): Promise<Array<{ signature: string; usdc: string; at: string }>> {
+    return (await this.ledger.deposits(owner)).map((d) => ({
       signature: d.signature,
       usdc: fromBaseUnits(BigInt(d.baseUnits)),
       at: d.at,
@@ -104,9 +112,13 @@ export class FundingService {
 }
 
 function defaultLog(r: CreditRecord): void {
+  const via =
+    r.asset === "sol" && r.lamports
+      ? ` [from ${Number(r.lamports) / 1e9} SOL @ ${r.priceUsdcPerSol}]`
+      : "";
   console.log(
     `[funding] credited ${fromBaseUnits(BigInt(r.baseUnits))} USDC to ${r.owner} ` +
-      `(sig=${r.signature}, ${r.commitment})`
+      `(sig=${r.signature}, ${r.commitment})${via}`
   );
 }
 

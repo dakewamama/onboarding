@@ -1,10 +1,7 @@
 /**
- * Minimal webhook receiver (devnet/staging prototype). Reads the RAW body (never
- * pre-parsed, so the signature verifies), runs the handler, and returns the
- * status Paj expects. In production this sits behind TLS + a real framework.
- *
- *   PAJ_API_KEY=... PAJ_WEBHOOK_SECRET=whsec_... PAJ_ENV=staging \
- *   yarn run paj-webhook-server
+ * The payments service: custodial wallets, airtime, custody transfers, deposit
+ * watching and the PAJ webhook receiver. Axis Money (the ledger) must be
+ * configured before anything else starts.
  */
 import * as http from "http";
 import { loadConfig } from "./config";
@@ -14,15 +11,29 @@ import { Settlement } from "./types";
 import { mountFunding } from "./funding/http";
 import { mountOfframp } from "./offramp";
 import { mountAirtime } from "./airtime";
+import { mountCustodyTransfer } from "./custodyTransferHttp";
+import { openMoneyLedger, PostgresMoneyLedger } from "./funding/moneyLedger";
+import { fundingStoreDir } from "./funding/config";
 
-// Keep the receiver alive through background faults. The funding watcher polls an
-// external RPC that can rate-limit or blip; a stray rejection there must never
-// take down the webhook receiver (which handles money). Log loudly, stay up.
+// Axis Money is configured before anything else. A missing production ledger
+// is fatal and must exit non-zero so the platform reports a failed deploy.
+let money: ReturnType<typeof openMoneyLedger>;
+try {
+  money = openMoneyLedger(process.env, fundingStoreDir(process.env));
+} catch (error) {
+  console.error("[money] ledger misconfigured; refusing to start:", (error as Error).message);
+  process.exit(1);
+}
+
+// A stray rejection (e.g. an RPC blip in a watcher poll) is logged and survived.
+// An uncaught exception leaves the process in an unknown state: exit and let the
+// platform restart it, rather than keep moving money from a corrupted process.
 process.on("unhandledRejection", (reason) => {
-  console.error("[fatal] unhandledRejection (kept alive):", reason);
+  console.error("[error] unhandledRejection:", reason);
 });
 process.on("uncaughtException", (err) => {
-  console.error("[fatal] uncaughtException (kept alive):", err);
+  console.error("[fatal] uncaughtException; exiting:", err);
+  process.exit(1);
 });
 
 const cfg = loadConfig();
@@ -35,10 +46,11 @@ if (!cfg.webhookSecret) {
 const provider = new PajProvider(cfg);
 const PORT = Number(process.env.PORT ?? 8788);
 
-// Replace this with your real crediting logic (e.g. release funds to the user).
-async function credit(s: Settlement): Promise<void> {
+// PAJ settlements are recorded, not credited: nothing in this service holds a
+// balance for PAJ orders (brain reconciles its own payouts). Log for audit.
+async function recordSettlement(s: Settlement): Promise<void> {
   console.log(
-    `[credit] order=${s.reference ?? "?"} pajId=${s.pajId} usdc=${s.amountUsdc} status=${s.status}`
+    `[paj] settled order=${s.reference ?? "?"} pajId=${s.pajId} usdc=${s.amountUsdc} status=${s.status}`
   );
 }
 
@@ -53,6 +65,7 @@ const offramp = mountOfframp(cfg);
 // INTERNAL_API_TOKEN). Shares funding's watch-armer so creating a user's wallet
 // also starts crediting its deposits.
 const airtime = mountAirtime(process.env, funding.armWatch);
+const custodyTransfer = mountCustodyTransfer(process.env);
 
 async function handlePajWebhook(req: http.IncomingMessage, res: http.ServerResponse) {
   const chunks: Buffer[] = [];
@@ -60,7 +73,7 @@ async function handlePajWebhook(req: http.IncomingMessage, res: http.ServerRespo
   req.on("end", async () => {
     const rawBody = Buffer.concat(chunks).toString("utf8");
     try {
-      const result = await handleWebhook(provider, rawBody, req.headers, credit);
+      const result = await handleWebhook(provider, rawBody, req.headers, recordSettlement);
       console.log(`[webhook] ${result.status} ${result.note}`);
       res.writeHead(result.status, { "content-type": "application/json" });
       res.end(JSON.stringify({ note: result.note }));
@@ -80,19 +93,26 @@ const server = http.createServer(async (req, res) => {
   if (req.method === "POST" && req.url === "/webhooks/paj") {
     return handlePajWebhook(req, res);
   }
+  if (await custodyTransfer.handle(req, res)) return;
   if (await offramp.handle(req, res)) return; // /offramp* claimed it
-  if (await airtime.handle(req, res)) return; // /airtime claimed it
+  if (await airtime.handle(req, res)) return;
   if (await funding.handle(req, res)) return; // /funding/* claimed it
   res.writeHead(404).end();
 });
 
-server.listen(PORT, () => {
+const moneyReady = money instanceof PostgresMoneyLedger ? money.migrate() : Promise.resolve();
+moneyReady.then(() => server.listen(PORT, () => {
   console.log(
     `Paj webhook receiver on http://localhost:${PORT}/webhooks/paj (env=${cfg.env}, mode=${cfg.mode})`
   );
   funding.logStatus(PORT);
+  custodyTransfer.logStatus(PORT);
   offramp.logStatus(PORT);
   airtime.logStatus(PORT);
+  console.log(`[money] ledger ${money instanceof PostgresMoneyLedger ? "postgres" : "file (development only)"}`);
+}), error => {
+  console.error("[money] ledger unavailable; refusing to start", error);
+  process.exit(1);
 });
 
 // Graceful shutdown: Railway sends SIGTERM to the old container on every redeploy.
@@ -100,7 +120,7 @@ server.listen(PORT, () => {
 // false alarm. Force-exit if something (e.g. the deposit watcher interval) hangs.
 function shutdown(signal: string): void {
   console.log(`[server] ${signal} received; shutting down cleanly`);
-  server.close(() => process.exit(0));
+  server.close(() => void money.close().finally(() => process.exit(0)));
   setTimeout(() => process.exit(0), 5000).unref();
 }
 process.on("SIGTERM", () => shutdown("SIGTERM"));

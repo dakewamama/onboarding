@@ -87,7 +87,6 @@ async function main() {
     pollIntervalMs: 15000,
     pageSize: 25,
     storeDir: tmpDir(),
-    corsOrigins: [],
   };
   // Only getLatestBlockhash is exercised; stub it so this stays offline.
   const stubConn = {

@@ -28,6 +28,31 @@ describe("custody (per-user wallet in the deployed service)", () => {
     assert.equal(walletAddressFor(dir, "web:1"), first.address);
   });
 
+  it("never gives two users the same wallet, even when their ids differ only in punctuation", () => {
+    const dir = tmp();
+    const e = env();
+    const a = provisionWallet(dir, "web:1", e);
+    const b = provisionWallet(dir, "web_1", e);
+    assert.isTrue(b.created);
+    assert.notEqual(a.address, b.address);
+  });
+
+  it("a pre-hash wallet file is claimed by its first exact owner and refused to others", () => {
+    const dir = tmp();
+    const e = env();
+    const { address } = provisionWallet(dir, "web_9", e);
+    // Recreate the old layout: the same record under the punctuation-folded name, no owner field.
+    const wallets = path.join(dir, "wallets");
+    const own = fs.readdirSync(wallets).find((f) => f.startsWith("u_"))!;
+    const rec = JSON.parse(fs.readFileSync(path.join(wallets, own), "utf8"));
+    delete rec.userId;
+    fs.rmSync(path.join(wallets, own));
+    fs.writeFileSync(path.join(wallets, "web_9.json"), JSON.stringify(rec));
+    assert.equal(walletAddressFor(dir, "web:9"), address, "first exact reader claims it");
+    assert.isTrue(fs.existsSync(path.join(wallets, "web_9.json.migrated")));
+    assert.isNull(walletAddressFor(dir, "web_9"), "the old file is no longer anyone else's");
+  });
+
   it("fails closed without a master key", () => {
     assert.throws(() => provisionWallet(tmp(), "u", {} as NodeJS.ProcessEnv), /KEYSTORE_MASTER_KEY/);
   });

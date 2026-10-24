@@ -2,6 +2,7 @@ import { assert } from "chai";
 import {
   serviceIdFor,
   buildRequestId,
+  requestIdForKey,
   parseVtpassResult,
   VtpassClient,
 } from "../payments/src/vtpassClient";
@@ -65,6 +66,7 @@ describe("VTpass airtime rail", () => {
       globalThis.fetch = (async (url: string, init: any) => {
         captured = { url, init };
         return {
+          ok: true,
           json: async () => ({
             code: "000",
             content: { transactions: { status: "delivered", transactionId: "tx9" } },
@@ -78,7 +80,7 @@ describe("VTpass airtime rail", () => {
         secretKey: "SK",
         env: "sandbox",
       });
-      const r = await client.buyAirtime({ network: "mtn", amount: 50, phone: "08011111111" });
+      const r = await client.buyAirtime({ network: "mtn", amount: 50, phone: "08011111111", requestId: "r9" });
 
       assert.equal(captured.url, "https://sandbox.vtpass.com/api/pay");
       assert.equal(captured.init.headers["api-key"], "AK");
@@ -102,11 +104,47 @@ describe("VTpass airtime rail", () => {
         }
       };
       assert.isTrue(
-        await rejects(client.buyAirtime({ network: "smart", amount: 50, phone: "080" })),
+        await rejects(client.buyAirtime({ network: "smart", amount: 50, phone: "080", requestId: "test-id" })),
       );
       assert.isTrue(
-        await rejects(client.buyAirtime({ network: "mtn", amount: 0, phone: "080" })),
+        await rejects(client.buyAirtime({ network: "mtn", amount: 0, phone: "080", requestId: "test-id" })),
       );
     });
+  });
+});
+
+
+describe("VTpass stable identity and requery", () => {
+  const originalFetch = globalThis.fetch;
+  afterEach(() => { globalThis.fetch = originalFetch; });
+
+  it("same stable key and persisted creation time always derive the same ID", () => {
+    const createdAt = new Date("2026-09-28T12:00:00Z");
+    assert.equal(requestIdForKey("axis-action-1", createdAt), requestIdForKey("axis-action-1", new Date(createdAt)));
+    assert.notEqual(requestIdForKey("axis-action-1", createdAt), requestIdForKey("axis-action-2", createdAt));
+    assert.match(requestIdForKey("axis-action-1", createdAt), /^202609281300[a-f0-9]+$/);
+  });
+
+  it("POSTs requery with the original request ID and service credentials", async () => {
+    globalThis.fetch = (async (url, init) => {
+      assert.equal(url, "https://sandbox.vtpass.com/api/requery");
+      assert.equal(init?.method, "POST");
+      assert.deepEqual(JSON.parse(String(init?.body)), { request_id: "original-id" });
+      assert.equal((init?.headers as Record<string, string>)["secret-key"], "test-secret");
+      assert.exists(init?.signal);
+      return new Response(JSON.stringify({ code: "000", requestId: "original-id", content: { transactions: { status: "delivered" } } }));
+    }) as typeof fetch;
+    const client = new VtpassClient({ apiKey: "test-key", secretKey: "test-secret", env: "sandbox" });
+    assert.isTrue((await client.requery("original-id")).success);
+  });
+
+  it("HTTP errors, malformed JSON, and mismatched replies cannot declare success", async () => {
+    const client = new VtpassClient({ apiKey: "test-key", secretKey: "test-secret", env: "sandbox" });
+    for (const response of [new Response("unavailable", { status: 503 }), new Response("not json"), new Response(JSON.stringify({ code: "000", requestId: "wrong", content: { transactions: { status: "delivered" } } }))]) {
+      globalThis.fetch = (async () => response) as typeof fetch;
+      const r = await client.requery("original-id");
+      assert.isFalse(r.success);
+      assert.equal(r.status, "unknown");
+    }
   });
 });

@@ -139,7 +139,7 @@ async function main() {
 
     const body = JSON.stringify({ id: "paj-42", status: "SUCCESSFUL", usdcAmount: 50 });
     const ts = Math.floor(Date.now() / 1000);
-    const sig = signWebhook(body, ts, cfg.webhookSecret);
+    const sig = signWebhook(body, ts, secret);
     const headers = { "x-paj-signature": sig, "x-paj-timestamp": String(ts) };
 
     let credited: Settlement[] = [];
@@ -170,7 +170,7 @@ async function main() {
     const body = JSON.stringify({ id: "test_sample_1", status: "SUCCESSFUL", usdcAmount: 1 });
     const ts = Math.floor(Date.now() / 1000);
     let credited = 0;
-    const r = await handleWebhook(provider, body, sign(body, ts, cfg.webhookSecret), async () => {
+    const r = await handleWebhook(provider, body, sign(body, ts, secret), async () => {
       credited++;
     });
     assert.strictEqual(r.status, 200);
@@ -186,12 +186,12 @@ async function main() {
     const ts = Math.floor(Date.now() / 1000);
 
     const pending = JSON.stringify({ id: "p1", status: "PROCESSING" });
-    const r1 = await handleWebhook(provider, pending, sign(pending, ts, cfg.webhookSecret), noop);
+    const r1 = await handleWebhook(provider, pending, sign(pending, ts, secret), noop);
     assert.strictEqual(r1.credited, false);
     assert.match(r1.note, /non-terminal/);
 
     const failed = JSON.stringify({ id: "p2", status: "FAILED" });
-    const r2 = await handleWebhook(provider, failed, sign(failed, ts, cfg.webhookSecret), noop);
+    const r2 = await handleWebhook(provider, failed, sign(failed, ts, secret), noop);
     assert.strictEqual(r2.credited, false);
     assert.match(r2.note, /failure/);
   });

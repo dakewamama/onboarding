@@ -8,7 +8,8 @@ import {
 } from "@solana/web3.js";
 import { getAssociatedTokenAddressSync } from "@solana/spl-token";
 import { FundingConfig } from "./config";
-import { DepositLedger, CreditRecord } from "./depositLedger";
+import type { CreditRecord } from "./depositLedger";
+import type { MoneyLedger } from "./moneyLedger";
 
 /**
  * Watches the chain for USDC arriving at each user's Axis wallet and credits the
@@ -17,9 +18,9 @@ import { DepositLedger, CreditRecord } from "./depositLedger";
  * webhook handler's discipline: parse a real terminal signal, then credit exactly
  * once via the durable, signature-keyed ledger.
  *
- * The set of watched owners is itself persisted, so a restart re-arms every watch
- * and the poll re-scans recent signatures — a deposit that landed while we were
- * down is picked up on the next poll and credited (idempotently) then.
+ * The watchlist and each owner's scan cursor are persisted, so after a restart
+ * the next poll reads everything since the cursor and credits (idempotently)
+ * any deposit that landed while the service was down.
  */
 export class UsdcWatcher {
   private connection: Connection;
@@ -33,10 +34,12 @@ export class UsdcWatcher {
   private backoffMs = 0;
   private static readonly BASE_BACKOFF_MS = 30_000;
   private static readonly MAX_BACKOFF_MS = 300_000;
+  /** Pages of new signatures read per owner per poll. */
+  private static readonly MAX_PAGES = 20;
 
   constructor(
     private cfg: FundingConfig,
-    private ledger: DepositLedger,
+    private ledger: Pick<MoneyLedger, "credit" | "hasCredited">,
     private onCredit: (r: CreditRecord) => void | Promise<void> = () => {},
     connection?: Connection
   ) {
@@ -60,15 +63,15 @@ export class UsdcWatcher {
 
   /** Persist an owner into the watchlist so it survives restarts. Idempotent. */
   watch(owner: string): void {
-    // Validate it is a real pubkey before we persist it.
-    new PublicKey(owner);
-    const file = path.join(this.watchDir, `${safe(owner)}.json`);
+    new PublicKey(owner); // only real public keys are persisted
+    const file = this.watchFile(owner);
     if (!fs.existsSync(file)) {
-      fs.writeFileSync(
-        file,
-        JSON.stringify({ owner, at: new Date().toISOString() }, null, 2)
-      );
+      fs.writeFileSync(file, JSON.stringify({ owner, at: new Date().toISOString() }, null, 2));
     }
+  }
+
+  private watchFile(owner: string): string {
+    return path.join(this.watchDir, `${safe(owner)}.json`);
   }
 
   private watchedOwners(): string[] {
@@ -76,6 +79,18 @@ export class UsdcWatcher {
       .readdirSync(this.watchDir)
       .filter((f) => f.endsWith(".json"))
       .map((f) => JSON.parse(fs.readFileSync(path.join(this.watchDir, f), "utf8")).owner);
+  }
+
+  /** Newest signature on the owner's deposit account that is fully handled. */
+  private cursor(owner: string): string | undefined {
+    const file = this.watchFile(owner);
+    return fs.existsSync(file) ? (JSON.parse(fs.readFileSync(file, "utf8")).cursor as string | undefined) : undefined;
+  }
+
+  private saveCursor(owner: string, cursor: string): void {
+    const file = this.watchFile(owner);
+    const record = fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : { owner, at: new Date().toISOString() };
+    fs.writeFileSync(file, JSON.stringify({ ...record, cursor }, null, 2));
   }
 
   /** Whether an RPC-reported confirmationStatus satisfies our required commitment. */
@@ -101,43 +116,73 @@ export class UsdcWatcher {
     return delta > BigInt(0) ? delta : BigInt(0);
   }
 
-  /** One scan of one owner's deposit account. Credits any fresh confirmed deposits. */
+  /**
+   * One scan of one owner's deposit account: every signature since the cursor,
+   * page by page, so a busy account (deposits plus outgoing transfers) never
+   * pushes a deposit out of view. Signatures are handled oldest first; the
+   * cursor only advances over ones that are settled one way or the other, so a
+   * deposit still short of the required commitment is looked at again next poll.
+   */
   async scanOwner(owner: string): Promise<void> {
     const ata = this.depositAta(owner);
-    const sigs = await this.connection.getSignaturesForAddress(ata, {
-      limit: this.cfg.pageSize,
-    });
-
-    for (const info of sigs) {
-      if (info.err) continue; // failed tx moved no funds
-      if (!this.meetsCommitment(info.confirmationStatus)) continue; // not yet confirmed enough
-      if (this.ledger.hasCredited(owner, info.signature)) continue; // already credited
-
-      const tx = await this.connection.getParsedTransaction(info.signature, {
-        commitment: this.cfg.commitment,
-        maxSupportedTransactionVersion: 0,
+    const until = this.cursor(owner);
+    const newestFirst: { signature: string; err: unknown; confirmationStatus?: string | null }[] = [];
+    let before: string | undefined;
+    let complete = false;
+    for (let page = 0; page < UsdcWatcher.MAX_PAGES; page++) {
+      const sigs = await this.connection.getSignaturesForAddress(ata, {
+        limit: this.cfg.pageSize,
+        ...(until ? { until } : {}),
+        ...(before ? { before } : {}),
       });
-      if (!tx || tx.meta?.err) continue;
+      newestFirst.push(...sigs);
+      if (sigs.length < this.cfg.pageSize) { complete = true; break; }
+      before = sigs[sigs.length - 1].signature;
+    }
+    if (!complete) {
+      console.warn(`[funding] ${owner}: more than ${UsdcWatcher.MAX_PAGES} pages of new activity; cursor held until it is all seen`);
+    }
 
-      const baseUnits = this.incomingBaseUnits(tx, owner);
-      if (baseUnits <= BigInt(0)) continue; // not an incoming USDC transfer
+    let advance = complete; // a gap behind an unseen page must not be skipped
+    for (const info of newestFirst.reverse()) {
+      const handled = await this.handleSignature(owner, info);
+      if (!handled) advance = false;
+      if (advance) this.saveCursor(owner, info.signature);
+    }
+  }
 
-      const fresh = this.ledger.credit({
+  /** True once the signature needs no further look: failed, not a deposit, or credited. */
+  private async handleSignature(owner: string, info: { signature: string; err: unknown; confirmationStatus?: string | null }): Promise<boolean> {
+    if (info.err) return true; // failed tx moved no funds
+    if (!this.meetsCommitment(info.confirmationStatus)) return false;
+    if (await this.ledger.hasCredited(owner, info.signature)) return true;
+
+    const tx = await this.connection.getParsedTransaction(info.signature, {
+      commitment: this.cfg.commitment,
+      maxSupportedTransactionVersion: 0,
+    });
+    if (!tx) return false; // not visible at this commitment yet
+    if (tx.meta?.err) return true;
+
+    const baseUnits = this.incomingBaseUnits(tx, owner);
+    if (baseUnits <= BigInt(0)) return true; // not an incoming USDC transfer
+
+    const fresh = await this.ledger.credit({
+      signature: info.signature,
+      owner,
+      baseUnits: baseUnits.toString(),
+      commitment: this.cfg.commitment,
+    });
+    if (fresh) {
+      await this.onCredit({
         signature: info.signature,
         owner,
         baseUnits: baseUnits.toString(),
         commitment: this.cfg.commitment,
+        at: new Date().toISOString(),
       });
-      if (fresh) {
-        await this.onCredit({
-          signature: info.signature,
-          owner,
-          baseUnits: baseUnits.toString(),
-          commitment: this.cfg.commitment,
-          at: new Date().toISOString(),
-        });
-      }
     }
+    return true;
   }
 
   /** One full poll across every watched owner. Single-flight, with RPC backoff. */
