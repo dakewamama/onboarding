@@ -101,6 +101,14 @@ The same service serves the USDC-funding routes (`/funding/*`) when
 only and need the `INTERNAL_API_TOKEN` bearer. Env: `SOLANA_RPC_URL`,
 `SOLANA_USDC_MINT`, `SOLANA_COMMITMENT`.
 
+The wallet routes (also `INTERNAL_API_TOKEN`-bearer) back the Axis wallet:
+`GET /wallet` provisions/returns the user's custodial address, `GET /wallet/balance`
+the spendable USDC, `GET /wallet/holdings` both USDC and SOL (so a payout can be
+funded in whichever the wallet holds), and `GET /wallet/activity` the wallet's
+deposits and debits. Custody transfers pay out in USDC, or in native SOL when the
+wallet is short on USDC and SOL payouts are enabled, always within the approved
+USDC maximum.
+
 Balances, spends and deposits live in **Axis Money**, a double-entry ledger in
 Postgres (`payments/src/funding/moneyLedger.ts`). Set `DATABASE_URL`; the image runs
 with `NODE_ENV=production` and refuses to start without it. Every movement is an
